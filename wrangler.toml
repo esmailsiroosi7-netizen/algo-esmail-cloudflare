@@ -2,6 +2,9 @@ name = "algo-esmail-cloudflare"
 main = "index.js"
 compatibility_date = "2026-09-01"
 
+[triggers]
+crons = ["0 * * * *"]
+
 [observability]
 enabled = false
 head_sampling_rate = 1
