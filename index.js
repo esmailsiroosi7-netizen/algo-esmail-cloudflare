@@ -11,10 +11,6 @@ const SYMBOLS = [
 const TIMEFRAMES = ["15m", "1h", "4h"];
 const TIMEOUT_MS = 8000;
 
-// =========================
-// درخواست با محدودیت زمانی
-// =========================
-
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
 
@@ -33,10 +29,6 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-// =========================
-// دریافت کندل
-// =========================
-
 async function getKlines(symbol, interval, limit = 100) {
   const url =
     `${BASE_URL}/quote/v1/klines` +
@@ -47,13 +39,13 @@ async function getKlines(symbol, interval, limit = 100) {
   const response = await fetchWithTimeout(url);
 
   if (!response.ok) {
-    throw new Error(`خطای توبیت: ${response.status}`);
+    throw new Error(`Toobit ${response.status}`);
   }
 
   const data = await response.json();
 
   if (!Array.isArray(data)) {
-    throw new Error("داده دریافتی از توبیت نامعتبر است");
+    throw new Error("داده نامعتبر");
   }
 
   return data.map(c => ({
@@ -65,14 +57,8 @@ async function getKlines(symbol, interval, limit = 100) {
   }));
 }
 
-// =========================
-// میانگین متحرک نمایی
-// =========================
-
 function ema(values, period) {
-  if (!values.length) {
-    return 0;
-  }
+  if (!values.length) return 0;
 
   const multiplier = 2 / (period + 1);
   let result = values[0];
@@ -86,14 +72,8 @@ function ema(values, period) {
   return result;
 }
 
-// =========================
-// قدرت نسبی بازار
-// =========================
-
 function calculateRSI(closes, period = 14) {
-  if (closes.length <= period) {
-    return 50;
-  }
+  if (closes.length <= period) return 50;
 
   let gains = 0;
   let losses = 0;
@@ -128,23 +108,15 @@ function calculateRSI(closes, period = 14) {
       period;
   }
 
-  if (avgLoss === 0) {
-    return 100;
-  }
+  if (avgLoss === 0) return 100;
 
   const rs = avgGain / avgLoss;
 
   return 100 - 100 / (1 + rs);
 }
 
-// =========================
-// دامنه واقعی بازار
-// =========================
-
 function calculateATR(candles, period = 14) {
-  if (candles.length < period + 1) {
-    return 0;
-  }
+  if (candles.length < period + 1) return 0;
 
   const trs = [];
 
@@ -154,12 +126,8 @@ function calculateATR(candles, period = 14) {
 
     const tr = Math.max(
       current.high - current.low,
-      Math.abs(
-        current.high - previous.close
-      ),
-      Math.abs(
-        current.low - previous.close
-      )
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
     );
 
     trs.push(tr);
@@ -174,10 +142,6 @@ function calculateATR(candles, period = 14) {
     ) / recent.length
   );
 }
-
-// =========================
-// تشخیص روند
-// =========================
 
 function getTrend(candles) {
   const closes =
@@ -208,10 +172,6 @@ function getTrend(candles) {
 
   return "خنثی";
 }
-
-// =========================
-// تشخیص شکست
-// =========================
 
 function detectBreakout(candles) {
   if (candles.length < 21) {
@@ -245,10 +205,6 @@ function detectBreakout(candles) {
       current.close < low
   };
 }
-
-// =========================
-// بررسی حجم
-// =========================
 
 function analyzeVolume(candles) {
   if (candles.length < 21) {
@@ -288,10 +244,6 @@ function analyzeVolume(candles) {
       current.close < current.open
   };
 }
-
-// =========================
-// تحلیل یک ارز
-// =========================
 
 async function analyzeSymbol(symbol) {
   const responses =
@@ -363,7 +315,6 @@ async function analyzeSymbol(symbol) {
   let longScore = 0;
   let shortScore = 0;
 
-  // روند ۴ ساعته
   if (trend4H === "صعودی") {
     longScore += 30;
   }
@@ -372,7 +323,6 @@ async function analyzeSymbol(symbol) {
     shortScore += 30;
   }
 
-  // روند یک ساعته
   if (trend1H === "صعودی") {
     longScore += 20;
   }
@@ -381,7 +331,6 @@ async function analyzeSymbol(symbol) {
     shortScore += 20;
   }
 
-  // روند ۱۵ دقیقه
   if (trend15M === "صعودی") {
     longScore += 10;
   }
@@ -390,7 +339,6 @@ async function analyzeSymbol(symbol) {
     shortScore += 10;
   }
 
-  // قدرت نسبی
   if (
     rsi > 52 &&
     rsi < 70
@@ -405,7 +353,6 @@ async function analyzeSymbol(symbol) {
     shortScore += 15;
   }
 
-  // شکست
   if (breakout.bullish) {
     longScore += 15;
   }
@@ -414,7 +361,6 @@ async function analyzeSymbol(symbol) {
     shortScore += 15;
   }
 
-  // حجم
   if (volume.bullish) {
     longScore += 10;
   }
@@ -506,10 +452,6 @@ async function analyzeSymbol(symbol) {
   };
 }
 
-// =========================
-// نمایش قیمت
-// =========================
-
 function formatPrice(value) {
   if (
     value === null ||
@@ -533,10 +475,6 @@ function formatPrice(value) {
 
   return value.toFixed(6);
 }
-
-// =========================
-// پیام تحلیل
-// =========================
 
 function makeSignalMessage(result) {
   const emoji =
@@ -573,7 +511,7 @@ ${result.trend1H}
 ⏱ روند ۱۵ دقیقه:
 ${result.trend15M}
 
-قدرت بازار:
+شاخص قدرت بازار:
 ${result.rsi.toFixed(1)}
 
 حجم معاملات:
@@ -610,10 +548,6 @@ ${formatPrice(result.tp3)}
   return message;
 }
 
-// =========================
-// ارسال پیام تلگرام
-// =========================
-
 async function sendTelegram(
   token,
   chatId,
@@ -638,7 +572,67 @@ async function sendTelegram(
       }
     );
 
-  return response.json();
+  const data =
+    await response.json();
+
+  if (!data.ok) {
+    throw new Error(
+      data.description ||
+      "خطای تلگرام"
+    );
+  }
+
+  return data;
+}
+
+// =========================
+// ذخیره چت در KV
+// =========================
+
+async function saveChat(env, chatId) {
+  if (!env.ALGO_ESMAIL_KV) {
+    throw new Error(
+      "ALGO_ESMAIL_KV متصل نیست"
+    );
+  }
+
+  await env.ALGO_ESMAIL_KV.put(
+    `chat:${chatId}`,
+    "active"
+  );
+}
+
+async function removeChat(env, chatId) {
+  if (!env.ALGO_ESMAIL_KV) {
+    throw new Error(
+      "ALGO_ESMAIL_KV متصل نیست"
+    );
+  }
+
+  await env.ALGO_ESMAIL_KV.delete(
+    `chat:${chatId}`
+  );
+}
+
+async function getSubscribedChats(env) {
+  if (!env.ALGO_ESMAIL_KV) {
+    throw new Error(
+      "ALGO_ESMAIL_KV متصل نیست"
+    );
+  }
+
+  const list =
+    await env.ALGO_ESMAIL_KV.list({
+      prefix: "chat:"
+    });
+
+  return list.keys.map(
+    key =>
+      key.name.replace(
+        "chat:",
+        ""
+      )
+  );
 }
 
 // =========================
@@ -647,9 +641,6 @@ async function sendTelegram(
 
 async function scanMarket() {
   const results = [];
-
-  // فعلاً ۵ ارز آزمایشی
-  // بعداً خودکار از توبیت دریافت می‌کنیم.
 
   for (
     let i = 0;
@@ -669,7 +660,7 @@ async function scanMarket() {
               );
             } catch (error) {
               console.error(
-                symbol,
+                `خطا در ${symbol}`,
                 error
               );
 
@@ -699,13 +690,7 @@ async function scanMarket() {
   );
 }
 
-// =========================
-// گزارش بازار
-// =========================
-
-function makeMarketReport(
-  results
-) {
+function makeMarketReport(results) {
   const strong =
     results.filter(
       r =>
@@ -745,8 +730,8 @@ ${index + 1}. *${r.symbol}*
 
 ${
   r.signal === "فرصت خرید"
-    ? "🟢 خرید"
-    : "🔴 فروش"
+    ? "🟢 فرصت خرید"
+    : "🔴 فرصت فروش"
 }
 
 امتیاز:
@@ -796,36 +781,44 @@ async function handleUpdate(
   const text =
     update.message.text || "";
 
-  // ثبت اشتراک
   if (text === "/subscribe") {
+    await saveChat(
+      env,
+      chatId
+    );
+
     return sendTelegram(
       env.BOT_TOKEN,
       chatId,
       `
-✅ اشتراک گزارش ساعتی فعال شد.
+✅ *گزارش خودکار فعال شد.*
 
-از این به بعد ربات گزارش بازار را به‌صورت خودکار برای شما ارسال می‌کند.
+از این به بعد ربات هر ساعت بازار را بررسی می‌کند و نتیجه را برای شما می‌فرستد.
 
-⚠️ در مرحله فعلی گزارش‌ها آزمایشی هستند.
+برای لغو:
+/unsubscribe
 `
     );
   }
 
-  // لغو اشتراک
   if (text === "/unsubscribe") {
+    await removeChat(
+      env,
+      chatId
+    );
+
     return sendTelegram(
       env.BOT_TOKEN,
       chatId,
       `
-✅ اشتراک گزارش ساعتی لغو شد.
+✅ گزارش خودکار غیرفعال شد.
 
-برای فعال‌سازی دوباره:
- /subscribe
+هر زمان خواستی دوباره فعالش کنی:
+/subscribe
 `
     );
   }
 
-  // شروع
   if (text === "/start") {
     return sendTelegram(
       env.BOT_TOKEN,
@@ -853,13 +846,10 @@ async function handleUpdate(
 
 /help
 راهنما
-
-⏰ گزارش بازار به‌صورت خودکار بررسی می‌شود.
 `
     );
   }
 
-  // راهنما
   if (text === "/help") {
     return sendTelegram(
       env.BOT_TOKEN,
@@ -873,21 +863,17 @@ async function handleUpdate(
 /signal BTC
 تحلیل بیت‌کوین
 
-/signal ETH
-تحلیل اتریوم
-
 /subscribe
 فعال‌سازی گزارش خودکار
 
 /unsubscribe
 لغو گزارش خودکار
 
-در نسخه‌های بعدی تعداد ارزهای بررسی‌شده افزایش پیدا می‌کند.
+⏰ ربات هر ساعت بازار را بررسی می‌کند.
 `
     );
   }
 
-  // اسکن
   if (text === "/scan") {
     await sendTelegram(
       env.BOT_TOKEN,
@@ -919,7 +905,6 @@ async function handleUpdate(
     return;
   }
 
-  // تحلیل یک ارز
   if (
     text.startsWith("/signal")
   ) {
@@ -977,7 +962,7 @@ async function handleUpdate(
 }
 
 // =========================
-// اجرای اصلی Worker
+// Worker
 // =========================
 
 export default {
@@ -1032,48 +1017,65 @@ export default {
     }
   },
 
-  // =========================
-  // اجرای خودکار هر ساعت
-  // =========================
-
   async scheduled(
     event,
     env,
     ctx
   ) {
     console.log(
-      "شروع بررسی خودکار بازار"
+      "شروع اسکن خودکار بازار"
     );
 
     if (!env.BOT_TOKEN) {
       console.error(
         "BOT_TOKEN تنظیم نشده است"
       );
-
       return;
     }
 
-    /*
-      فعلاً Cron فقط بازار را بررسی می‌کند.
-
-      برای ارسال واقعی گزارش،
-      باید شناسه چت در KV ذخیره شود.
-
-      این قسمت در مرحله بعد
-      به KV متصل می‌شود.
-    */
-
     try {
+      const chats =
+        await getSubscribedChats(
+          env
+        );
+
+      if (!chats.length) {
+        console.log(
+          "هیچ کاربر فعالی وجود ندارد"
+        );
+        return;
+      }
+
       const results =
         await scanMarket();
 
+      const report =
+        makeMarketReport(
+          results
+        );
+
+      for (const chatId of chats) {
+        try {
+          await sendTelegram(
+            env.BOT_TOKEN,
+            chatId,
+            report
+          );
+        } catch (error) {
+          console.error(
+            `خطا در ارسال به ${chatId}`,
+            error
+          );
+        }
+      }
+
       console.log(
-        "بررسی خودکار انجام شد",
-        results
+        `گزارش برای ${chats.length} چت ارسال شد`
       );
+
     } catch (error) {
       console.error(
-        "خطا در بررسی خودکار",
+        "خطا در اسکن خودکار:",
         error
       );
     }
