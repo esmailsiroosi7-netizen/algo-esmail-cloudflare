@@ -9,7 +9,6 @@ const SYMBOLS = [
 ];
 
 const TIMEFRAMES = ["15m", "1h", "4h"];
-
 const TIMEOUT_MS = 8000;
 
 // =========================
@@ -39,27 +38,22 @@ async function fetchWithTimeout(url, options = {}) {
 // =========================
 
 async function getKlines(symbol, interval, limit = 100) {
-
   const url =
     `${BASE_URL}/quote/v1/klines` +
     `?symbol=${encodeURIComponent(symbol)}` +
     `&interval=${interval}` +
     `&limit=${limit}`;
 
-  const response =
-    await fetchWithTimeout(url);
+  const response = await fetchWithTimeout(url);
 
   if (!response.ok) {
-    throw new Error(
-      `Toobit ${response.status}`
-    );
+    throw new Error(`خطای توبیت: ${response.status}`);
   }
 
-  const data =
-    await response.json();
+  const data = await response.json();
 
   if (!Array.isArray(data)) {
-    throw new Error("داده کندل نامعتبر است");
+    throw new Error("داده دریافتی از توبیت نامعتبر است");
   }
 
   return data.map(c => ({
@@ -76,25 +70,16 @@ async function getKlines(symbol, interval, limit = 100) {
 // =========================
 
 function ema(values, period) {
-
   if (!values.length) {
     return 0;
   }
 
-  const multiplier =
-    2 / (period + 1);
-
+  const multiplier = 2 / (period + 1);
   let result = values[0];
 
-  for (
-    let i = 1;
-    i < values.length;
-    i++
-  ) {
-
+  for (let i = 1; i < values.length; i++) {
     result =
-      (values[i] - result) *
-      multiplier +
+      (values[i] - result) * multiplier +
       result;
   }
 
@@ -102,32 +87,20 @@ function ema(values, period) {
 }
 
 // =========================
-// شاخص قدرت نسبی
+// قدرت نسبی بازار
 // =========================
 
-function calculateRSI(
-  closes,
-  period = 14
-) {
-
-  if (
-    closes.length <= period
-  ) {
+function calculateRSI(closes, period = 14) {
+  if (closes.length <= period) {
     return 50;
   }
 
   let gains = 0;
   let losses = 0;
 
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-
+  for (let i = 1; i <= period; i++) {
     const change =
-      closes[i] -
-      closes[i - 1];
+      closes[i] - closes[i - 1];
 
     if (change > 0) {
       gains += change;
@@ -136,109 +109,67 @@ function calculateRSI(
     }
   }
 
-  let avgGain =
-    gains / period;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
 
-  let avgLoss =
-    losses / period;
-
-  for (
-    let i = period + 1;
-    i < closes.length;
-    i++
-  ) {
-
+  for (let i = period + 1; i < closes.length; i++) {
     const change =
-      closes[i] -
-      closes[i - 1];
+      closes[i] - closes[i - 1];
 
-    const gain =
-      Math.max(change, 0);
-
-    const loss =
-      Math.max(-change, 0);
+    const gain = Math.max(change, 0);
+    const loss = Math.max(-change, 0);
 
     avgGain =
-      (
-        avgGain * (period - 1) +
-        gain
-      ) / period;
+      (avgGain * (period - 1) + gain) /
+      period;
 
     avgLoss =
-      (
-        avgLoss * (period - 1) +
-        loss
-      ) / period;
+      (avgLoss * (period - 1) + loss) /
+      period;
   }
 
   if (avgLoss === 0) {
     return 100;
   }
 
-  const rs =
-    avgGain / avgLoss;
+  const rs = avgGain / avgLoss;
 
-  return (
-    100 -
-    100 / (1 + rs)
-  );
+  return 100 - 100 / (1 + rs);
 }
 
 // =========================
-// میانگین دامنه واقعی
+// دامنه واقعی بازار
 // =========================
 
-function calculateATR(
-  candles,
-  period = 14
-) {
-
-  if (
-    candles.length <
-    period + 1
-  ) {
+function calculateATR(candles, period = 14) {
+  if (candles.length < period + 1) {
     return 0;
   }
 
   const trs = [];
 
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
-    const current =
-      candles[i];
-
-    const previous =
-      candles[i - 1];
-
-    const tr =
-      Math.max(
-        current.high -
-          current.low,
-
-        Math.abs(
-          current.high -
-            previous.close
-        ),
-
-        Math.abs(
-          current.low -
-            previous.close
-        )
-      );
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
+    );
 
     trs.push(tr);
   }
 
-  const recent =
-    trs.slice(-period);
+  const recent = trs.slice(-period);
 
   return (
     recent.reduce(
-      (a, b) => a + b,
+      (sum, value) => sum + value,
       0
     ) / recent.length
   );
@@ -249,26 +180,17 @@ function calculateATR(
 // =========================
 
 function getTrend(candles) {
-
   const closes =
-    candles.map(
-      c => c.close
-    );
+    candles.map(c => c.close);
 
   const price =
     closes[closes.length - 1];
 
   const ema50 =
-    ema(
-      closes.slice(-100),
-      50
-    );
+    ema(closes.slice(-100), 50);
 
   const ema200 =
-    ema(
-      closes,
-      200
-    );
+    ema(closes, 200);
 
   if (
     price > ema50 &&
@@ -288,14 +210,11 @@ function getTrend(candles) {
 }
 
 // =========================
-// شکست محدوده
+// تشخیص شکست
 // =========================
 
 function detectBreakout(candles) {
-
-  if (
-    candles.length < 21
-  ) {
+  if (candles.length < 21) {
     return {
       bullish: false,
       bearish: false
@@ -310,20 +229,15 @@ function detectBreakout(candles) {
 
   const high =
     Math.max(
-      ...previous.map(
-        c => c.high
-      )
+      ...previous.map(c => c.high)
     );
 
   const low =
     Math.min(
-      ...previous.map(
-        c => c.low
-      )
+      ...previous.map(c => c.low)
     );
 
   return {
-
     bullish:
       current.close > high,
 
@@ -333,14 +247,11 @@ function detectBreakout(candles) {
 }
 
 // =========================
-// حجم معاملات
+// بررسی حجم
 // =========================
 
 function analyzeVolume(candles) {
-
-  if (
-    candles.length < 21
-  ) {
+  if (candles.length < 21) {
     return {
       ratio: 1,
       bullish: false,
@@ -356,30 +267,25 @@ function analyzeVolume(candles) {
 
   const average =
     previous.reduce(
-      (sum, c) =>
-        sum + c.volume,
+      (sum, c) => sum + c.volume,
       0
     ) / previous.length;
 
   const ratio =
     average > 0
-      ? current.volume /
-        average
+      ? current.volume / average
       : 1;
 
   return {
-
     ratio,
 
     bullish:
       ratio >= 1.2 &&
-      current.close >
-        current.open,
+      current.close > current.open,
 
     bearish:
       ratio >= 1.2 &&
-      current.close <
-        current.open
+      current.close < current.open
   };
 }
 
@@ -387,10 +293,7 @@ function analyzeVolume(candles) {
 // تحلیل یک ارز
 // =========================
 
-async function analyzeSymbol(
-  symbol
-) {
-
+async function analyzeSymbol(symbol) {
   const responses =
     await Promise.allSettled(
       TIMEFRAMES.map(
@@ -409,15 +312,11 @@ async function analyzeSymbol(
     i < TIMEFRAMES.length;
     i++
   ) {
-
     if (
       responses[i].status ===
       "fulfilled"
     ) {
-
-      candles[
-        TIMEFRAMES[i]
-      ] =
+      candles[TIMEFRAMES[i]] =
         responses[i].value;
     }
   }
@@ -426,25 +325,17 @@ async function analyzeSymbol(
     !candles["1h"] ||
     !candles["4h"]
   ) {
-
     throw new Error(
       "اطلاعات کافی دریافت نشد"
     );
   }
 
-  const h1 =
-    candles["1h"];
-
-  const h4 =
-    candles["4h"];
-
-  const m15 =
-    candles["15m"] ||
-    h1;
+  const h1 = candles["1h"];
+  const h4 = candles["4h"];
+  const m15 = candles["15m"] || h1;
 
   const price =
-    h1[h1.length - 1]
-      .close;
+    h1[h1.length - 1].close;
 
   const trend4H =
     getTrend(h4);
@@ -457,9 +348,7 @@ async function analyzeSymbol(
 
   const rsi =
     calculateRSI(
-      h1.map(
-        c => c.close
-      )
+      h1.map(c => c.close)
     );
 
   const atr =
@@ -475,49 +364,33 @@ async function analyzeSymbol(
   let shortScore = 0;
 
   // روند ۴ ساعته
-
-  if (
-    trend4H === "صعودی"
-  ) {
+  if (trend4H === "صعودی") {
     longScore += 30;
   }
 
-  if (
-    trend4H === "نزولی"
-  ) {
+  if (trend4H === "نزولی") {
     shortScore += 30;
   }
 
   // روند یک ساعته
-
-  if (
-    trend1H === "صعودی"
-  ) {
+  if (trend1H === "صعودی") {
     longScore += 20;
   }
 
-  if (
-    trend1H === "نزولی"
-  ) {
+  if (trend1H === "نزولی") {
     shortScore += 20;
   }
 
   // روند ۱۵ دقیقه
-
-  if (
-    trend15M === "صعودی"
-  ) {
+  if (trend15M === "صعودی") {
     longScore += 10;
   }
 
-  if (
-    trend15M === "نزولی"
-  ) {
+  if (trend15M === "نزولی") {
     shortScore += 10;
   }
 
-  // RSI
-
+  // قدرت نسبی
   if (
     rsi > 52 &&
     rsi < 70
@@ -533,35 +406,24 @@ async function analyzeSymbol(
   }
 
   // شکست
-
-  if (
-    breakout.bullish
-  ) {
+  if (breakout.bullish) {
     longScore += 15;
   }
 
-  if (
-    breakout.bearish
-  ) {
+  if (breakout.bearish) {
     shortScore += 15;
   }
 
   // حجم
-
-  if (
-    volume.bullish
-  ) {
+  if (volume.bullish) {
     longScore += 10;
   }
 
-  if (
-    volume.bearish
-  ) {
+  if (volume.bearish) {
     shortScore += 10;
   }
 
-  let signal =
-    "بدون سیگنال";
+  let signal = "بدون سیگنال";
 
   if (
     longScore >= 70 &&
@@ -569,9 +431,7 @@ async function analyzeSymbol(
       shortScore + 10 &&
     trend4H === "صعودی"
   ) {
-
-    signal =
-      "فرصت خرید";
+    signal = "فرصت خرید";
   }
 
   if (
@@ -580,9 +440,7 @@ async function analyzeSymbol(
       longScore + 10 &&
     trend4H === "نزولی"
   ) {
-
-    signal =
-      "فرصت فروش";
+    signal = "فرصت فروش";
   }
 
   let stop = null;
@@ -594,10 +452,8 @@ async function analyzeSymbol(
     signal === "فرصت خرید" &&
     atr > 0
   ) {
-
     stop =
-      price -
-      atr * 0.8;
+      price - atr * 0.8;
 
     const risk =
       price - stop;
@@ -616,10 +472,8 @@ async function analyzeSymbol(
     signal === "فرصت فروش" &&
     atr > 0
   ) {
-
     stop =
-      price +
-      atr * 0.8;
+      price + atr * 0.8;
 
     const risk =
       stop - price;
@@ -635,28 +489,16 @@ async function analyzeSymbol(
   }
 
   return {
-
     symbol,
-
     price,
-
     signal,
-
     longScore,
-
     shortScore,
-
     trend4H,
-
     trend1H,
-
     trend15M,
-
     rsi,
-
-    volumeRatio:
-      volume.ratio,
-
+    volumeRatio: volume.ratio,
     stop,
     tp1,
     tp2,
@@ -669,7 +511,6 @@ async function analyzeSymbol(
 // =========================
 
 function formatPrice(value) {
-
   if (
     value === null ||
     value === undefined
@@ -678,7 +519,6 @@ function formatPrice(value) {
   }
 
   if (value >= 1000) {
-
     return value.toLocaleString(
       "en-US",
       {
@@ -698,21 +538,15 @@ function formatPrice(value) {
 // پیام تحلیل
 // =========================
 
-function makeSignalMessage(
-  result
-) {
-
+function makeSignalMessage(result) {
   const emoji =
-    result.signal ===
-    "فرصت خرید"
+    result.signal === "فرصت خرید"
       ? "🟢"
-      : result.signal ===
-        "فرصت فروش"
+      : result.signal === "فرصت فروش"
       ? "🔴"
       : "⏳";
 
-  let message =
-`
+  let message = `
 ${emoji} *الگو اسماعیل V2*
 
 ارز:
@@ -750,9 +584,7 @@ ${result.volumeRatio.toFixed(2)} برابر
     result.signal !==
     "بدون سیگنال"
   ) {
-
-    message +=
-`
+    message += `
 ━━━━━━━━━━━━━━
 
 🎯 نقطه ورود:
@@ -772,15 +604,14 @@ ${formatPrice(result.tp3)}
 `;
   }
 
-  message +=
-`
+  message += `
 ⚠️ این تحلیل آزمایشی است و توصیه مالی نیست.`;
 
   return message;
 }
 
 // =========================
-// ارسال تلگرام
+// ارسال پیام تلگرام
 // =========================
 
 async function sendTelegram(
@@ -788,7 +619,6 @@ async function sendTelegram(
   chatId,
   text
 ) {
-
   const response =
     await fetchWithTimeout(
       `https://api.telegram.org/bot${token}/sendMessage`,
@@ -803,8 +633,7 @@ async function sendTelegram(
         body: JSON.stringify({
           chat_id: chatId,
           text,
-          parse_mode:
-            "Markdown"
+          parse_mode: "Markdown"
         })
       }
     );
@@ -817,34 +646,28 @@ async function sendTelegram(
 // =========================
 
 async function scanMarket() {
-
   const results = [];
+
+  // فعلاً ۵ ارز آزمایشی
+  // بعداً خودکار از توبیت دریافت می‌کنیم.
 
   for (
     let i = 0;
     i < SYMBOLS.length;
     i += 2
   ) {
-
     const batch =
-      SYMBOLS.slice(
-        i,
-        i + 2
-      );
+      SYMBOLS.slice(i, i + 2);
 
     const batchResults =
       await Promise.all(
         batch.map(
           async symbol => {
-
             try {
-
               return await analyzeSymbol(
                 symbol
               );
-
             } catch (error) {
-
               console.error(
                 symbol,
                 error
@@ -883,7 +706,6 @@ async function scanMarket() {
 function makeMarketReport(
   results
 ) {
-
   const strong =
     results.filter(
       r =>
@@ -892,20 +714,18 @@ function makeMarketReport(
     );
 
   if (!strong.length) {
-
     return `
 ⏰ *گزارش ساعتی بازار*
 
 در حال حاضر فرصت معاملاتی قدرتمندی پیدا نشد.
 
-بازار تحت نظر است 👀
+بازار همچنان تحت نظر است 👀
 
 گزارش بعدی یک ساعت دیگر.
 `;
   }
 
-  let message =
-`
+  let message = `
 🚨 *گزارش ساعتی بازار*
 
 فرصت‌های قابل توجه:
@@ -914,20 +734,17 @@ function makeMarketReport(
 
   strong.forEach(
     (r, index) => {
-
       const score =
         Math.max(
           r.longScore,
           r.shortScore
         );
 
-      message +=
-`
+      message += `
 ${index + 1}. *${r.symbol}*
 
 ${
-  r.signal ===
-  "فرصت خرید"
+  r.signal === "فرصت خرید"
     ? "🟢 خرید"
     : "🔴 فروش"
 }
@@ -949,29 +766,27 @@ ${r.rsi.toFixed(1)}
     }
   );
 
-  message +=
-`
+  message += `
 ⚠️ تحلیل آزمایشی است.`;
 
   return message;
 }
 
 // =========================
-// پردازش تلگرام
+// پردازش پیام تلگرام
 // =========================
 
 async function handleUpdate(
   update,
   env
 ) {
-
   if (!update.message) {
     return;
   }
 
   if (!env.BOT_TOKEN) {
     throw new Error(
-      "BOT_TOKEN missing"
+      "BOT_TOKEN تنظیم نشده است"
     );
   }
 
@@ -981,14 +796,41 @@ async function handleUpdate(
   const text =
     update.message.text || "";
 
-  if (
-    text === "/start"
-  ) {
-
-    await sendTelegram(
+  // ثبت اشتراک
+  if (text === "/subscribe") {
+    return sendTelegram(
       env.BOT_TOKEN,
       chatId,
+      `
+✅ اشتراک گزارش ساعتی فعال شد.
+
+از این به بعد ربات گزارش بازار را به‌صورت خودکار برای شما ارسال می‌کند.
+
+⚠️ در مرحله فعلی گزارش‌ها آزمایشی هستند.
 `
+    );
+  }
+
+  // لغو اشتراک
+  if (text === "/unsubscribe") {
+    return sendTelegram(
+      env.BOT_TOKEN,
+      chatId,
+      `
+✅ اشتراک گزارش ساعتی لغو شد.
+
+برای فعال‌سازی دوباره:
+ /subscribe
+`
+    );
+  }
+
+  // شروع
+  if (text === "/start") {
+    return sendTelegram(
+      env.BOT_TOKEN,
+      chatId,
+      `
 🤖 *الگو اسماعیل V2*
 
 سلام 👋
@@ -998,29 +840,31 @@ async function handleUpdate(
 دستورات:
 
 /scan
-اسکن بازار
+بررسی بازار
 
 /signal BTC
 تحلیل بیت‌کوین
 
+/subscribe
+فعال‌سازی گزارش ساعتی
+
+/unsubscribe
+لغو گزارش ساعتی
+
 /help
 راهنما
 
-⏰ گزارش بازار نیز به‌صورت خودکار ارسال می‌شود.
+⏰ گزارش بازار به‌صورت خودکار بررسی می‌شود.
 `
     );
-
-    return;
   }
 
-  if (
-    text === "/help"
-  ) {
-
-    await sendTelegram(
+  // راهنما
+  if (text === "/help") {
+    return sendTelegram(
       env.BOT_TOKEN,
       chatId,
-`
+      `
 📚 *راهنمای ربات*
 
 /scan
@@ -1032,17 +876,19 @@ async function handleUpdate(
 /signal ETH
 تحلیل اتریوم
 
-گزارش بازار هر ساعت به‌صورت خودکار ارسال می‌شود.
+/subscribe
+فعال‌سازی گزارش خودکار
+
+/unsubscribe
+لغو گزارش خودکار
+
+در نسخه‌های بعدی تعداد ارزهای بررسی‌شده افزایش پیدا می‌کند.
 `
     );
-
-    return;
   }
 
-  if (
-    text === "/scan"
-  ) {
-
+  // اسکن
+  if (text === "/scan") {
     await sendTelegram(
       env.BOT_TOKEN,
       chatId,
@@ -1050,7 +896,6 @@ async function handleUpdate(
     );
 
     try {
-
       const results =
         await scanMarket();
 
@@ -1061,9 +906,7 @@ async function handleUpdate(
           results
         )
       );
-
     } catch (error) {
-
       console.error(error);
 
       await sendTelegram(
@@ -1076,10 +919,10 @@ async function handleUpdate(
     return;
   }
 
+  // تحلیل یک ارز
   if (
     text.startsWith("/signal")
   ) {
-
     let symbol =
       text
         .replace(
@@ -1098,7 +941,6 @@ async function handleUpdate(
         "-SWAP-USDT"
       )
     ) {
-
       symbol =
         `${symbol}-SWAP-USDT`;
     }
@@ -1110,7 +952,6 @@ async function handleUpdate(
     );
 
     try {
-
       const result =
         await analyzeSymbol(
           symbol
@@ -1123,9 +964,7 @@ async function handleUpdate(
           result
         )
       );
-
     } catch (error) {
-
       console.error(error);
 
       await sendTelegram(
@@ -1138,7 +977,7 @@ async function handleUpdate(
 }
 
 // =========================
-// WORKER
+// اجرای اصلی Worker
 // =========================
 
 export default {
@@ -1147,11 +986,9 @@ export default {
     request,
     env
   ) {
-
     if (
       request.method === "GET"
     ) {
-
       return new Response(
         "Algo Esmail V2 is running!"
       );
@@ -1160,7 +997,6 @@ export default {
     if (
       request.method !== "POST"
     ) {
-
       return new Response(
         "Method Not Allowed",
         {
@@ -1170,7 +1006,6 @@ export default {
     }
 
     try {
-
       const update =
         await request.json();
 
@@ -1182,9 +1017,7 @@ export default {
       return new Response(
         "OK"
       );
-
     } catch (error) {
-
       console.error(
         "WORKER ERROR",
         error
@@ -1199,41 +1032,48 @@ export default {
     }
   },
 
+  // =========================
+  // اجرای خودکار هر ساعت
+  // =========================
+
   async scheduled(
     event,
     env,
     ctx
   ) {
+    console.log(
+      "شروع بررسی خودکار بازار"
+    );
 
     if (!env.BOT_TOKEN) {
       console.error(
-        "BOT_TOKEN missing"
+        "BOT_TOKEN تنظیم نشده است"
       );
 
       return;
     }
 
-    // فعلاً همان ۵ ارز آزمایشی
-    try {
+    /*
+      فعلاً Cron فقط بازار را بررسی می‌کند.
 
+      برای ارسال واقعی گزارش،
+      باید شناسه چت در KV ذخیره شود.
+
+      این قسمت در مرحله بعد
+      به KV متصل می‌شود.
+    */
+
+    try {
       const results =
         await scanMarket();
 
-      // این قسمت بعداً chat_id
-      // را از KV می‌خواند.
-      //
-      // فعلاً برای جلوگیری از
-      // ارسال اشتباه، چیزی نمی‌فرستیم.
-
       console.log(
-        "Hourly scan completed",
+        "بررسی خودکار انجام شد",
         results
       );
-
     } catch (error) {
-
       console.error(
-        "HOURLY SCAN ERROR",
+        "خطا در بررسی خودکار",
         error
       );
     }
