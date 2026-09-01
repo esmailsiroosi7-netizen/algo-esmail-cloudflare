@@ -14,10 +14,9 @@ const TIMEOUT_MS = 8000;
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
 
-  const timer = setTimeout(
-    () => controller.abort(),
-    TIMEOUT_MS
-  );
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, TIMEOUT_MS);
 
   try {
     return await fetch(url, {
@@ -116,7 +115,9 @@ function calculateRSI(closes, period = 14) {
 }
 
 function calculateATR(candles, period = 14) {
-  if (candles.length < period + 1) return 0;
+  if (candles.length < period + 1) {
+    return 0;
+  }
 
   const trs = [];
 
@@ -126,8 +127,12 @@ function calculateATR(candles, period = 14) {
 
     const tr = Math.max(
       current.high - current.low,
-      Math.abs(current.high - previous.close),
-      Math.abs(current.low - previous.close)
+      Math.abs(
+        current.high - previous.close
+      ),
+      Math.abs(
+        current.low - previous.close
+      )
     );
 
     trs.push(tr);
@@ -284,7 +289,8 @@ async function analyzeSymbol(symbol) {
 
   const h1 = candles["1h"];
   const h4 = candles["4h"];
-  const m15 = candles["15m"] || h1;
+  const m15 =
+    candles["15m"] || h1;
 
   const price =
     h1[h1.length - 1].close;
@@ -484,7 +490,7 @@ function makeSignalMessage(result) {
       ? "🔴"
       : "⏳";
 
-  let message = `
+  return `
 ${emoji} *الگو اسماعیل V2*
 
 ارز:
@@ -511,18 +517,15 @@ ${result.trend1H}
 ⏱ روند ۱۵ دقیقه:
 ${result.trend15M}
 
-شاخص قدرت بازار:
+💪 قدرت بازار:
 ${result.rsi.toFixed(1)}
 
-حجم معاملات:
+📊 حجم:
 ${result.volumeRatio.toFixed(2)} برابر
-`;
 
-  if (
-    result.signal !==
-    "بدون سیگنال"
-  ) {
-    message += `
+${
+  result.signal !== "بدون سیگنال"
+    ? `
 ━━━━━━━━━━━━━━
 
 🎯 نقطه ورود:
@@ -539,13 +542,12 @@ ${formatPrice(result.tp2)}
 
 🎯 هدف سوم:
 ${formatPrice(result.tp3)}
+`
+    : ""
+}
+
+⚠️ این تحلیل آزمایشی است و توصیه مالی نیست.
 `;
-  }
-
-  message += `
-⚠️ این تحلیل آزمایشی است و توصیه مالی نیست.`;
-
-  return message;
 }
 
 async function sendTelegram(
@@ -585,42 +587,28 @@ async function sendTelegram(
   return data;
 }
 
-// =========================
-// ذخیره چت در KV
-// =========================
-
-async function saveChat(env, chatId) {
-  if (!env.ALGO_ESMAIL_KV) {
-    throw new Error(
-      "ALGO_ESMAIL_KV متصل نیست"
-    );
-  }
-
+async function saveChat(
+  env,
+  chatId
+) {
   await env.ALGO_ESMAIL_KV.put(
     `chat:${chatId}`,
     "active"
   );
 }
 
-async function removeChat(env, chatId) {
-  if (!env.ALGO_ESMAIL_KV) {
-    throw new Error(
-      "ALGO_ESMAIL_KV متصل نیست"
-    );
-  }
-
+async function removeChat(
+  env,
+  chatId
+) {
   await env.ALGO_ESMAIL_KV.delete(
     `chat:${chatId}`
   );
 }
 
-async function getSubscribedChats(env) {
-  if (!env.ALGO_ESMAIL_KV) {
-    throw new Error(
-      "ALGO_ESMAIL_KV متصل نیست"
-    );
-  }
-
+async function getSubscribedChats(
+  env
+) {
   const list =
     await env.ALGO_ESMAIL_KV.list({
       prefix: "chat:"
@@ -634,10 +622,6 @@ async function getSubscribedChats(env) {
       )
   );
 }
-
-// =========================
-// اسکن بازار
-// =========================
 
 async function scanMarket() {
   const results = [];
@@ -690,7 +674,98 @@ async function scanMarket() {
   );
 }
 
-function makeMarketReport(results) {
+// نتیجه کامل برای /scan
+function makeScanReport(results) {
+  if (
+    !results ||
+    !results.length
+  ) {
+    return `
+❌ *اسکن بازار انجام نشد*
+
+هیچ اطلاعات معتبری از توبیت دریافت نشد.
+`;
+  }
+
+  let message = `
+🔎 *نتیجه اسکن بازار توبیت*
+
+تعداد ارزهای بررسی‌شده:
+${results.length}
+
+`;
+
+  results.forEach(
+    (r, index) => {
+      const bestScore =
+        Math.max(
+          r.longScore,
+          r.shortScore
+        );
+
+      let signal =
+        "⏳ بدون سیگنال";
+
+      if (
+        r.signal === "فرصت خرید"
+      ) {
+        signal =
+          "🟢 فرصت خرید";
+      }
+
+      if (
+        r.signal === "فرصت فروش"
+      ) {
+        signal =
+          "🔴 فرصت فروش";
+      }
+
+      message += `
+*${index + 1}. ${r.symbol}*
+
+${signal}
+
+💰 قیمت:
+${formatPrice(r.price)}
+
+📊 امتیاز خرید:
+${r.longScore} از 100
+
+📊 امتیاز فروش:
+${r.shortScore} از 100
+
+⭐ بهترین امتیاز:
+${bestScore} از 100
+
+📈 روند ۴ ساعته:
+${r.trend4H}
+
+📈 روند ۱ ساعته:
+${r.trend1H}
+
+⏱ روند ۱۵ دقیقه:
+${r.trend15M}
+
+💪 قدرت بازار:
+${r.rsi.toFixed(1)}
+
+📊 حجم:
+${r.volumeRatio.toFixed(2)} برابر
+
+━━━━━━━━━━━━━━
+`;
+    }
+  );
+
+  message += `
+⚠️ تحلیل آزمایشی است.
+`;
+
+  return message;
+}
+
+// گزارش ساعتی فقط فرصت‌های قوی
+function makeHourlyReport(results) {
   const strong =
     results.filter(
       r =>
@@ -751,15 +826,8 @@ ${r.rsi.toFixed(1)}
     }
   );
 
-  message += `
-⚠️ تحلیل آزمایشی است.`;
-
   return message;
 }
-
-// =========================
-// پردازش پیام تلگرام
-// =========================
 
 async function handleUpdate(
   update,
@@ -781,7 +849,9 @@ async function handleUpdate(
   const text =
     update.message.text || "";
 
-  if (text === "/subscribe") {
+  if (
+    text === "/subscribe"
+  ) {
     await saveChat(
       env,
       chatId
@@ -793,7 +863,7 @@ async function handleUpdate(
       `
 ✅ *گزارش خودکار فعال شد.*
 
-از این به بعد ربات هر ساعت بازار را بررسی می‌کند و نتیجه را برای شما می‌فرستد.
+از این به بعد ربات هر ساعت بازار را بررسی می‌کند.
 
 برای لغو:
 /unsubscribe
@@ -801,7 +871,9 @@ async function handleUpdate(
     );
   }
 
-  if (text === "/unsubscribe") {
+  if (
+    text === "/unsubscribe"
+  ) {
     await removeChat(
       env,
       chatId
@@ -813,7 +885,7 @@ async function handleUpdate(
       `
 ✅ گزارش خودکار غیرفعال شد.
 
-هر زمان خواستی دوباره فعالش کنی:
+برای فعال‌سازی دوباره:
 /subscribe
 `
     );
@@ -833,7 +905,7 @@ async function handleUpdate(
 دستورات:
 
 /scan
-بررسی بازار
+بررسی کامل بازار
 
 /signal BTC
 تحلیل بیت‌کوین
@@ -858,10 +930,10 @@ async function handleUpdate(
 📚 *راهنمای ربات*
 
 /scan
-بررسی بازار
+بررسی کامل بازار
 
 /signal BTC
-تحلیل بیت‌کوین
+تحلیل یک ارز
 
 /subscribe
 فعال‌سازی گزارش خودکار
@@ -869,7 +941,7 @@ async function handleUpdate(
 /unsubscribe
 لغو گزارش خودکار
 
-⏰ ربات هر ساعت بازار را بررسی می‌کند.
+⏰ گزارش خودکار هر ساعت ارسال می‌شود.
 `
     );
   }
@@ -878,7 +950,7 @@ async function handleUpdate(
     await sendTelegram(
       env.BOT_TOKEN,
       chatId,
-      "🔎 در حال بررسی بازار..."
+      "🔎 در حال بررسی بازار توبیت..."
     );
 
     try {
@@ -888,7 +960,7 @@ async function handleUpdate(
       await sendTelegram(
         env.BOT_TOKEN,
         chatId,
-        makeMarketReport(
+        makeScanReport(
           results
         )
       );
@@ -958,12 +1030,10 @@ async function handleUpdate(
         `❌ اطلاعات ${symbol} دریافت نشد.`
       );
     }
+
+    return;
   }
 }
-
-// =========================
-// Worker
-// =========================
 
 export default {
 
@@ -1050,11 +1120,13 @@ export default {
         await scanMarket();
 
       const report =
-        makeMarketReport(
+        makeHourlyReport(
           results
         );
 
-      for (const chatId of chats) {
+      for (
+        const chatId of chats
+      ) {
         try {
           await sendTelegram(
             env.BOT_TOKEN,
@@ -1068,10 +1140,6 @@ export default {
           );
         }
       }
-
-      console.log(
-        `گزارش برای ${chats.length} چت ارسال شد`
-      );
 
     } catch (error) {
       console.error(
