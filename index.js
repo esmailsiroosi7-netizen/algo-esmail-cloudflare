@@ -1,3827 +1,2060 @@
+// ============================================================
+// ALGO ESMAIL V5 - Toobit Market Analyzer
+// Cloudflare Workers + Telegram
+// ============================================================
+
 const BASE_URL = "https://api.toobit.com";
 
-const TIMEOUT_MS = 7000;
+const TIMEOUT_MS = 6000;
 
-// --------------------------------------------------
-// تنظیمات
-// --------------------------------------------------
+// تنظیمات اسکن
+const MAX_ANALYSIS_SYMBOLS = 8;
+const ANALYSIS_BATCH = 4;
+const SHORTLIST_FOR_DERIVATIVES = 3;
 
+const MIN_SIGNAL_SCORE = 65;
+
+// معاملات کاغذی
 const PAPER_BUDGET = 100;
 const RISK_PERCENT = 1;
 
-const TOP_OPPORTUNITIES = 5;
-
-// تعداد ارزهایی که در هر اسکن تحلیل می‌شوند
-const MAX_ANALYSIS_SYMBOLS = 10;
-
-// تعداد همزمان تحلیل‌ها
-const ANALYSIS_BATCH = 3;
-
-// حداقل امتیاز سیگنال
-const MIN_SIGNAL_SCORE = 70;
-
-// --------------------------------------------------
-// ابزارهای عمومی
-// --------------------------------------------------
+// ============================================================
+// عمومی
+// ============================================================
 
 function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function log(message, data = "") {
-  console.log(
-    `[ALGO ESMAIL] ${message}`,
-    data
-  );
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-// --------------------------------------------------
-// درخواست API با Timeout
-// --------------------------------------------------
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
 
-async function fetchWithTimeout(
-  url,
-  options = {}
-) {
-  const controller =
-    new AbortController();
+function average(arr) {
+  const values = arr.filter(Number.isFinite);
+  if (!values.length) return 0;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
 
-  const timer = setTimeout(
-    () => controller.abort(),
-    TIMEOUT_MS
-  );
+function formatNumber(value, digits = 6) {
+  const n = safeNumber(value);
+  if (!n) return "0";
+
+  if (Math.abs(n) >= 1000) return n.toFixed(2);
+  if (Math.abs(n) >= 1) return n.toFixed(4);
+  if (Math.abs(n) >= 0.01) return n.toFixed(5);
+
+  return n.toFixed(digits);
+}
+
+function percent(value, digits = 2) {
+  return `${safeNumber(value).toFixed(digits)}%`;
+}
+
+function escapeMarkdown(text) {
+  return String(text)
+    .replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
+
+// ============================================================
+// HTTP
+// ============================================================
+
+async function fetchJson(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    return await fetch(url, {
+    const response = await fetch(url, {
       ...options,
-      signal: controller.signal
+      signal: controller.signal,
+      headers: {
+        "Accept": "application/json",
+        ...(options.headers || {})
+      }
     });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Invalid JSON response: ${text.slice(0, 300)}`);
+    }
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function getJson(
-  url,
-  options = {}
-) {
-  const response =
-    await fetchWithTimeout(
-      url,
-      options
-    );
+// ============================================================
+// TELEGRAM
+// ============================================================
+
+async function telegram(method, data, env) {
+  if (!env.BOT_TOKEN) {
+    throw new Error("BOT_TOKEN تنظیم نشده است.");
+  }
+
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(data)
+  });
+
+  const text = await response.text();
 
   if (!response.ok) {
-    throw new Error(
-      `HTTP ${response.status}`
-    );
+    throw new Error(`Telegram HTTP ${response.status}: ${text}`);
   }
 
-  return await response.json();
-}
+  let result;
 
-// --------------------------------------------------
-// دریافت کندل‌ها
-// --------------------------------------------------
-
-async function getKlines(
-  symbol,
-  interval,
-  limit = 200
-) {
-  const url =
-    `${BASE_URL}/quote/v1/klines` +
-    `?symbol=${encodeURIComponent(symbol)}` +
-    `&interval=${interval}` +
-    `&limit=${limit}`;
-
-  const data =
-    await getJson(url);
-
-  if (!Array.isArray(data)) {
-    throw new Error(
-      `داده کندل ${symbol} ${interval} نامعتبر است`
-    );
-  }
-
-  return data
-    .map(c => ({
-      time: Number(c[0]),
-      open: Number(c[1]),
-      high: Number(c[2]),
-      low: Number(c[3]),
-      close: Number(c[4]),
-      volume: Number(c[5])
-    }))
-    .filter(c =>
-      Number.isFinite(c.open) &&
-      Number.isFinite(c.high) &&
-      Number.isFinite(c.low) &&
-      Number.isFinite(c.close)
-    );
-}
-
-// --------------------------------------------------
-// Funding Rate
-// --------------------------------------------------
-
-async function getFundingRate(
-  symbol
-) {
   try {
-    const data =
-      await getJson(
-        `${BASE_URL}/api/v1/futures/fundingRate?symbol=${encodeURIComponent(symbol)}`
-      );
-
-    if (
-      !Array.isArray(data) ||
-      !data.length
-    ) {
-      return 0;
-    }
-
-    return Number(
-      data[0].rate || 0
-    );
-  } catch (error) {
-    log(
-      `Funding ناموفق: ${symbol}`,
-      error.message
-    );
-
-    return 0;
-  }
-}
-
-// --------------------------------------------------
-// Open Interest
-// --------------------------------------------------
-
-async function getOpenInterest(
-  symbol
-) {
-  try {
-    const data =
-      await getJson(
-        `${BASE_URL}/quote/v1/openInterest?symbol=${encodeURIComponent(symbol)}`
-      );
-
-    if (
-      data &&
-      Array.isArray(
-        data.openInterestList
-      ) &&
-      data.openInterestList.length
-    ) {
-      return Number(
-        data.openInterestList[0].size || 0
-      );
-    }
-
-    return 0;
-  } catch (error) {
-    log(
-      `OI ناموفق: ${symbol}`,
-      error.message
-    );
-
-    return 0;
-  }
-}
-
-// --------------------------------------------------
-// Long / Short
-// --------------------------------------------------
-
-async function getLongShortRatio(
-  symbol
-) {
-  try {
-    const url =
-      `${BASE_URL}/quote/v1/globalLongShortAccountRatio` +
-      `?symbol=${encodeURIComponent(symbol)}` +
-      `&period=1h` +
-      `&limit=1`;
-
-    const data =
-      await getJson(url);
-
-    if (
-      !Array.isArray(data) ||
-      !data.length
-    ) {
-      return 1;
-    }
-
-    return Number(
-      data[0].longShortRatio || 1
-    );
-  } catch (error) {
-    log(
-      `LongShort ناموفق: ${symbol}`,
-      error.message
-    );
-
-    return 1;
-  }
-}
-
-// --------------------------------------------------
-// نمادهای فعال
-// --------------------------------------------------
-
-async function getSymbols() {
-  log("دریافت نمادهای فعال...");
-
-  const data =
-    await getJson(
-      `${BASE_URL}/api/v1/exchangeInfo`
-    );
-
-  const contracts =
-    Array.isArray(data.contracts)
-      ? data.contracts
-      : [];
-
-  const symbols =
-    contracts
-      .filter(c =>
-        c &&
-        c.status === "TRADING" &&
-        c.marginToken === "USDT" &&
-        c.symbol &&
-        c.symbol.endsWith(
-          "-SWAP-USDT"
-        )
-      )
-      .map(c => c.symbol);
-
-  log(
-    `تعداد نمادهای فعال: ${symbols.length}`
-  );
-
-  return symbols;
-}
-
-// --------------------------------------------------
-// تیکر 24 ساعته
-// --------------------------------------------------
-
-async function getTickers() {
-  try {
-    const data =
-      await getJson(
-        `${BASE_URL}/quote/v1/contract/ticker/24hr`
-      );
-
-    if (!Array.isArray(data)) {
-      return [];
-    }
-
-    return data;
-  } catch (error) {
-    log(
-      "دریافت تیکر ناموفق",
-      error.message
-    );
-
-    return [];
-  }
-}
-
-// --------------------------------------------------
-// انتخاب بهترین ارزها
-// --------------------------------------------------
-
-async function getBestSymbols() {
-  log("انتخاب ارزهای مناسب...");
-
-  const [
-    symbols,
-    tickers
-  ] = await Promise.all([
-    getSymbols(),
-    getTickers()
-  ]);
-
-  const tickerMap =
-    new Map();
-
-  for (const ticker of tickers) {
-    if (!ticker.s) {
-      continue;
-    }
-
-    tickerMap.set(
-      ticker.s,
-      {
-        volume:
-          Number(ticker.v || 0),
-
-        quoteVolume:
-          Number(ticker.qv || 0),
-
-        change:
-          Number(ticker.pcp || 0)
-      }
-    );
+    result = JSON.parse(text);
+  } catch {
+    throw new Error(`Telegram پاسخ نامعتبر داد: ${text}`);
   }
 
-  const ranked =
-    symbols
-      .map(symbol => ({
-        symbol,
-
-        ...(tickerMap.get(
-          symbol
-        ) || {
-          volume: 0,
-          quoteVolume: 0,
-          change: 0
-        })
-      }))
-      .filter(
-        x =>
-          x.quoteVolume > 0
-      )
-      .sort(
-        (a, b) =>
-          b.quoteVolume -
-          a.quoteVolume
-      );
-
-  const selected =
-    ranked
-      .slice(
-        0,
-        MAX_ANALYSIS_SYMBOLS
-      )
-      .map(
-        x => x.symbol
-      );
-
-  log(
-    `تعداد ارز انتخاب‌شده: ${selected.length}`,
-    selected.join(", ")
-  );
-
-  return selected;
-}
-
-// --------------------------------------------------
-// EMA
-// --------------------------------------------------
-
-function ema(
-  values,
-  period
-) {
-  if (!values.length) {
-    return 0;
-  }
-
-  const multiplier =
-    2 /
-    (period + 1);
-
-  let result =
-    values[0];
-
-  for (
-    let i = 1;
-    i < values.length;
-    i++
-  ) {
-    result =
-      (
-        values[i] -
-        result
-      ) *
-        multiplier +
-      result;
+  if (!result.ok) {
+    throw new Error(`Telegram error: ${text}`);
   }
 
   return result;
 }
 
-// --------------------------------------------------
-// RSI
-// --------------------------------------------------
+async function sendMessage(chatId, text, env, options = {}) {
+  return telegram("sendMessage", {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+    ...options
+  }, env);
+}
 
-function calculateRSI(
-  closes,
-  period = 14
-) {
+// ============================================================
+// TOOBIT - SYMBOLS
+// ============================================================
+
+async function getExchangeInfo() {
+  return fetchJson(`${BASE_URL}/api/v1/exchangeInfo`);
+}
+
+function extractContracts(data) {
+  if (!data) return [];
+
+  if (Array.isArray(data.contracts)) return data.contracts;
+  if (Array.isArray(data.data?.contracts)) return data.data.contracts;
+
+  return [];
+}
+
+function isValidContract(contract) {
+  const symbol = contract?.symbol || "";
+
+  if (!symbol) return false;
+
+  const status = String(contract.status || "").toUpperCase();
+
   if (
-    closes.length <= period
+    status &&
+    !["TRADING", "NORMAL", "ONLINE"].includes(status)
   ) {
-    return 50;
+    return false;
   }
 
-  let gain = 0;
-  let loss = 0;
+  return (
+    symbol.endsWith("-SWAP-USDT") ||
+    symbol.endsWith("-USDT")
+  );
+}
 
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-    const change =
-      closes[i] -
-      closes[i - 1];
+// ============================================================
+// TOOBIT - TICKERS
+// ============================================================
 
-    if (change > 0) {
-      gain += change;
-    } else {
-      loss -= change;
+async function getAllTickers() {
+  const data = await fetchJson(
+    `${BASE_URL}/quote/v1/contract/ticker/24hr`
+  );
+
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data.data)) return data.data;
+  if (Array.isArray(data.tickers)) return data.tickers;
+
+  return [];
+}
+
+function tickerSymbol(t) {
+  return t.symbol || t.s || "";
+}
+
+function tickerPrice(t) {
+  return safeNumber(
+    t.lastPrice ??
+    t.last ??
+    t.price ??
+    t.c
+  );
+}
+
+function tickerVolume(t) {
+  return safeNumber(
+    t.quoteVolume ??
+    t.volume24h ??
+    t.quoteVolume24h ??
+    t.qv ??
+    t.volume
+  );
+}
+
+function tickerChange(t) {
+  return safeNumber(
+    t.priceChangePercent ??
+    t.changePercent ??
+    t.p
+  );
+}
+
+// ============================================================
+// انتخاب ارزهای مناسب
+// ============================================================
+
+async function getBestSymbols() {
+  const [exchangeInfo, tickers] = await Promise.all([
+    getExchangeInfo(),
+    getAllTickers()
+  ]);
+
+  const contracts = extractContracts(exchangeInfo);
+
+  const allowed = new Set(
+    contracts
+      .filter(isValidContract)
+      .map(x => x.symbol)
+  );
+
+  let candidates = tickers
+    .map(t => ({
+      symbol: tickerSymbol(t),
+      price: tickerPrice(t),
+      volume: tickerVolume(t),
+      change: tickerChange(t)
+    }))
+    .filter(x => {
+      if (!x.symbol || !x.price) return false;
+
+      if (allowed.size && !allowed.has(x.symbol)) {
+        return false;
+      }
+
+      return (
+        x.symbol.endsWith("-SWAP-USDT") ||
+        x.symbol.endsWith("-USDT")
+      );
+    });
+
+  // اولویت با حجم معاملات
+  candidates.sort((a, b) => b.volume - a.volume);
+
+  // BTC را حتماً در صورت وجود نگه می‌داریم
+  const btc = candidates.find(x =>
+    x.symbol === "BTC-SWAP-USDT"
+  );
+
+  const selected = [];
+
+  if (btc) selected.push(btc);
+
+  for (const item of candidates) {
+    if (selected.some(x => x.symbol === item.symbol)) continue;
+
+    selected.push(item);
+
+    if (selected.length >= MAX_ANALYSIS_SYMBOLS) {
+      break;
     }
   }
 
-  let avgGain =
-    gain / period;
+  return selected;
+}
 
-  let avgLoss =
-    loss / period;
+// ============================================================
+// KLINES
+// ============================================================
 
-  for (
-    let i =
-      period + 1;
-    i < closes.length;
-    i++
-  ) {
-    const change =
-      closes[i] -
-      closes[i - 1];
+async function getKlines(symbol, interval, limit = 150) {
+  const url =
+    `${BASE_URL}/quote/v1/klines` +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    `&limit=${limit}`;
 
-    const currentGain =
-      Math.max(
-        change,
-        0
-      );
+  const data = await fetchJson(url);
 
-    const currentLoss =
-      Math.max(
-        -change,
-        0
-      );
+  let rows = [];
 
-    avgGain =
-      (
-        avgGain *
-          (period - 1) +
-        currentGain
-      ) /
-      period;
-
-    avgLoss =
-      (
-        avgLoss *
-          (period - 1) +
-        currentLoss
-      ) /
-      period;
+  if (Array.isArray(data)) {
+    rows = data;
+  } else if (Array.isArray(data.data)) {
+    rows = data.data;
   }
+
+  return rows
+    .map(row => {
+      if (Array.isArray(row)) {
+        return {
+          time: safeNumber(row[0]),
+          open: safeNumber(row[1]),
+          high: safeNumber(row[2]),
+          low: safeNumber(row[3]),
+          close: safeNumber(row[4]),
+          volume: safeNumber(row[5])
+        };
+      }
+
+      return {
+        time: safeNumber(row.time ?? row.openTime),
+        open: safeNumber(row.open),
+        high: safeNumber(row.high),
+        low: safeNumber(row.low),
+        close: safeNumber(row.close),
+        volume: safeNumber(row.volume)
+      };
+    })
+    .filter(x =>
+      x.open > 0 &&
+      x.high > 0 &&
+      x.low > 0 &&
+      x.close > 0
+    );
+}
+
+// ============================================================
+// INDICATORS
+// ============================================================
+
+function ema(values, period) {
+  if (!values.length) return [];
+
+  const result = new Array(values.length).fill(null);
+
+  if (values.length < period) return result;
+
+  const multiplier = 2 / (period + 1);
+
+  let sum = 0;
+
+  for (let i = 0; i < period; i++) {
+    sum += values[i];
+  }
+
+  result[period - 1] = sum / period;
+
+  for (let i = period; i < values.length; i++) {
+    result[i] =
+      (values[i] - result[i - 1]) * multiplier +
+      result[i - 1];
+  }
+
+  return result;
+}
+
+function rsi(values, period = 14) {
+  const result = new Array(values.length).fill(null);
+
+  if (values.length <= period) return result;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = 1; i <= period; i++) {
+    const diff = values[i] - values[i - 1];
+
+    if (diff >= 0) gains += diff;
+    else losses += Math.abs(diff);
+  }
+
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
 
   if (avgLoss === 0) {
-    return 100;
+    result[period] = 100;
+  } else {
+    const rs = avgGain / avgLoss;
+    result[period] = 100 - 100 / (1 + rs);
   }
 
-  const rs =
-    avgGain /
-    avgLoss;
+  for (let i = period + 1; i < values.length; i++) {
+    const diff = values[i] - values[i - 1];
 
-  return (
-    100 -
-    100 /
-      (1 + rs)
-  );
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+
+    avgGain =
+      ((avgGain * (period - 1)) + gain) / period;
+
+    avgLoss =
+      ((avgLoss * (period - 1)) + loss) / period;
+
+    if (avgLoss === 0) {
+      result[i] = 100;
+    } else {
+      const rs = avgGain / avgLoss;
+      result[i] = 100 - 100 / (1 + rs);
+    }
+  }
+
+  return result;
 }
 
-// --------------------------------------------------
-// ATR
-// --------------------------------------------------
+function atr(candles, period = 14) {
+  const result = new Array(candles.length).fill(null);
 
-function calculateATR(
-  candles,
-  period = 14
-) {
-  if (
-    candles.length <
-    period + 1
-  ) {
-    return 0;
-  }
+  if (candles.length <= period) return result;
 
-  const trs = [];
+  const tr = new Array(candles.length).fill(0);
 
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
-    const c =
-      candles[i];
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1].close;
 
-    const p =
-      candles[i - 1];
-
-    const tr =
-      Math.max(
-        c.high -
-          c.low,
-
-        Math.abs(
-          c.high -
-          p.close
-        ),
-
-        Math.abs(
-          c.low -
-          p.close
-        )
-      );
-
-    trs.push(tr);
-  }
-
-  const recent =
-    trs.slice(-period);
-
-  return (
-    recent.reduce(
-      (a, b) =>
-        a + b,
-      0
-    ) /
-    recent.length
-  );
-}
-
-// --------------------------------------------------
-// MACD
-// --------------------------------------------------
-
-function calculateMACD(
-  closes
-) {
-  if (
-    closes.length < 35
-  ) {
-    return {
-      macd: 0,
-      signal: 0,
-      histogram: 0
-    };
-  }
-
-  const macdValues = [];
-
-  for (
-    let i = 25;
-    i < closes.length;
-    i++
-  ) {
-    const slice =
-      closes.slice(
-        0,
-        i + 1
-      );
-
-    const fast =
-      ema(slice, 12);
-
-    const slow =
-      ema(slice, 26);
-
-    macdValues.push(
-      fast - slow
+    tr[i] = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
     );
   }
 
-  const macd =
-    macdValues[
-      macdValues.length - 1
-    ];
+  let initial = 0;
 
-  const signal =
-    ema(
-      macdValues.slice(
-        -9
-      ),
-      9
-    );
+  for (let i = 1; i <= period; i++) {
+    initial += tr[i];
+  }
+
+  result[period] = initial / period;
+
+  for (let i = period + 1; i < candles.length; i++) {
+    result[i] =
+      ((result[i - 1] * (period - 1)) + tr[i]) /
+      period;
+  }
+
+  return result;
+}
+
+function macd(values) {
+  const fast = ema(values, 12);
+  const slow = ema(values, 26);
+
+  const line = new Array(values.length).fill(null);
+
+  for (let i = 0; i < values.length; i++) {
+    if (fast[i] != null && slow[i] != null) {
+      line[i] = fast[i] - slow[i];
+    }
+  }
+
+  const valid = line.filter(x => x != null);
+
+  const signalValid = ema(valid, 9);
+
+  const signal = new Array(values.length).fill(null);
+
+  let j = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    if (line[i] != null) {
+      signal[i] = signalValid[j];
+      j++;
+    }
+  }
+
+  const histogram = new Array(values.length).fill(null);
+
+  for (let i = 0; i < values.length; i++) {
+    if (line[i] != null && signal[i] != null) {
+      histogram[i] = line[i] - signal[i];
+    }
+  }
 
   return {
-    macd,
+    line,
     signal,
-    histogram:
-      macd - signal
+    histogram
   };
 }
 
-// --------------------------------------------------
-// ADX تقریبی
-// --------------------------------------------------
+// ============================================================
+// CANDLE PATTERNS
+// ============================================================
 
-function calculateADX(
-  candles,
-  period = 14
-) {
-  if (
-    candles.length <
-    period + 2
-  ) {
-    return 20;
+function candlePatterns(candles) {
+  if (candles.length < 3) return [];
+
+  const a = candles[candles.length - 3];
+  const b = candles[candles.length - 2];
+  const c = candles[candles.length - 1];
+
+  const patterns = [];
+
+  const body = Math.abs(c.close - c.open);
+  const range = c.high - c.low;
+
+  if (range > 0 && body / range < 0.1) {
+    patterns.push("دوجی");
   }
 
-  let plusDM = 0;
-  let minusDM = 0;
-  let trSum = 0;
-
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-    const c =
-      candles[i];
-
-    const p =
-      candles[i - 1];
-
-    const up =
-      c.high -
-      p.high;
-
-    const down =
-      p.low -
-      c.low;
-
-    if (
-      up > down &&
-      up > 0
-    ) {
-      plusDM += up;
-    }
-
-    if (
-      down > up &&
-      down > 0
-    ) {
-      minusDM += down;
-    }
-
-    trSum +=
-      Math.max(
-        c.high -
-          c.low,
-
-        Math.abs(
-          c.high -
-          p.close
-        ),
-
-        Math.abs(
-          c.low -
-          p.close
-        )
-      );
-  }
-
-  if (trSum === 0) {
-    return 0;
-  }
-
-  const plusDI =
-    100 *
-    plusDM /
-    trSum;
-
-  const minusDI =
-    100 *
-    minusDM /
-    trSum;
+  const upper = c.high - Math.max(c.open, c.close);
+  const lower = Math.min(c.open, c.close) - c.low;
 
   if (
-    plusDI +
-      minusDI ===
-    0
+    lower > body * 2 &&
+    upper < body
   ) {
-    return 0;
+    patterns.push("چکش");
   }
 
-  return (
-    100 *
-    Math.abs(
-      plusDI -
-        minusDI
-    ) /
-    (
-      plusDI +
-      minusDI
-    )
-  );
+  if (
+    upper > body * 2 &&
+    lower < body
+  ) {
+    patterns.push("شهاب‌سنگ");
+  }
+
+  // Engulfing صعودی
+  if (
+    b.close < b.open &&
+    c.close > c.open &&
+    c.open <= b.close &&
+    c.close >= b.open
+  ) {
+    patterns.push("پوشای صعودی");
+  }
+
+  // Engulfing نزولی
+  if (
+    b.close > b.open &&
+    c.close < c.open &&
+    c.open >= b.close &&
+    c.close <= b.open
+  ) {
+    patterns.push("پوشای نزولی");
+  }
+
+  // Pin bar
+  if (
+    lower > body * 2 &&
+    lower > upper * 2
+  ) {
+    patterns.push("پین‌بار صعودی");
+  }
+
+  if (
+    upper > body * 2 &&
+    upper > lower * 2
+  ) {
+    patterns.push("پین‌بار نزولی");
+  }
+
+  return patterns;
 }
 
-// --------------------------------------------------
-// روند
-// --------------------------------------------------
+// ============================================================
+// ساختار بازار
+// ============================================================
 
-function getTrend(
-  candles
-) {
-  if (
-    !candles ||
-    candles.length < 50
-  ) {
-    return "نامشخص";
-  }
+function marketStructure(candles) {
+  if (candles.length < 20) return "نامشخص";
 
-  const closes =
-    candles.map(
-      c => c.close
-    );
+  const recent = candles.slice(-20);
 
-  const price =
-    closes[
-      closes.length - 1
-    ];
+  const highs = recent.map(x => x.high);
+  const lows = recent.map(x => x.low);
 
-  const ema20 =
-    ema(
-      closes.slice(
-        -80
-      ),
-      20
-    );
+  const mid = 10;
 
-  const ema50 =
-    ema(
-      closes.slice(
-        -120
-      ),
-      50
-    );
+  const firstHigh = Math.max(...highs.slice(0, mid));
+  const secondHigh = Math.max(...highs.slice(mid));
 
-  const ema200 =
-    ema(
-      closes,
-      200
-    );
+  const firstLow = Math.min(...lows.slice(0, mid));
+  const secondLow = Math.min(...lows.slice(mid));
 
   if (
-    price > ema20 &&
-    ema20 > ema50 &&
-    ema50 > ema200
-  ) {
-    return "صعودی قوی";
-  }
-
-  if (
-    price > ema50 &&
-    ema50 > ema200
+    secondHigh > firstHigh &&
+    secondLow > firstLow
   ) {
     return "صعودی";
   }
 
   if (
-    price < ema20 &&
-    ema20 < ema50 &&
-    ema50 < ema200
-  ) {
-    return "نزولی قوی";
-  }
-
-  if (
-    price < ema50 &&
-    ema50 < ema200
+    secondHigh < firstHigh &&
+    secondLow < firstLow
   ) {
     return "نزولی";
   }
 
-  return "خنثی";
+  return "رنج";
 }
 
-// --------------------------------------------------
-// حمایت و مقاومت
-// --------------------------------------------------
+// ============================================================
+// حمایت / مقاومت
+// ============================================================
 
-function getSupportResistance(
-  candles
-) {
-  const recent =
-    candles.slice(-40);
-
-  return {
-    support:
-      Math.min(
-        ...recent.map(
-          c => c.low
-        )
-      ),
-
-    resistance:
-      Math.max(
-        ...recent.map(
-          c => c.high
-        )
-      )
-  };
-}
-
-// --------------------------------------------------
-// تحلیل حجم
-// --------------------------------------------------
-
-function volumeAnalysis(
-  candles
-) {
-  if (
-    candles.length < 21
-  ) {
+function supportResistance(candles) {
+  if (!candles.length) {
     return {
-      ratio: 1,
-      bullish: false,
-      bearish: false
+      support: 0,
+      resistance: 0
     };
   }
 
-  const current =
-    candles[
-      candles.length - 1
-    ];
+  const recent = candles.slice(-40);
 
-  const previous =
-    candles.slice(
-      -21,
-      -1
-    );
+  return {
+    support: Math.min(...recent.map(x => x.low)),
+    resistance: Math.max(...recent.map(x => x.high))
+  };
+}
 
-  const average =
-    previous.reduce(
-      (sum, c) =>
-        sum + c.volume,
-      0
-    ) /
-    previous.length;
+// ============================================================
+// تحلیل یک تایم‌فریم
+// ============================================================
 
-  const ratio =
-    average > 0
-      ? current.volume /
-        average
+function analyzeTimeframe(candles) {
+  if (!candles || candles.length < 60) {
+    throw new Error("داده کافی برای تحلیل وجود ندارد.");
+  }
+
+  const closes = candles.map(x => x.close);
+
+  const ema20 = ema(closes, 20);
+  const ema50 = ema(closes, 50);
+  const ema200 = ema(closes, 200);
+
+  const rsiValues = rsi(closes, 14);
+  const atrValues = atr(candles, 14);
+  const macdData = macd(closes);
+
+  const i = candles.length - 1;
+
+  const price = closes[i];
+
+  const e20 = ema20[i];
+  const e50 = ema50[i];
+
+  const e200 =
+    ema200[i] ??
+    ema50[i];
+
+  const rsiValue = rsiValues[i];
+  const atrValue = atrValues[i];
+
+  const macdLine = macdData.line[i];
+  const macdSignal = macdData.signal[i];
+  const macdHistogram = macdData.histogram[i];
+
+  const structure = marketStructure(candles);
+  const sr = supportResistance(candles);
+
+  const recentVolumes = candles
+    .slice(-21, -1)
+    .map(x => x.volume);
+
+  const avgVolume = average(recentVolumes);
+
+  const currentVolume = candles[i].volume;
+
+  const volumeRatio =
+    avgVolume > 0
+      ? currentVolume / avgVolume
       : 1;
 
-  return {
-    ratio,
+  let bull = 0;
+  let bear = 0;
 
-    bullish:
-      ratio >= 1.2 &&
-      current.close >
-        current.open,
+  // EMA
+  if (e20 > e50) bull += 15;
+  else if (e20 < e50) bear += 15;
 
-    bearish:
-      ratio >= 1.2 &&
-      current.close <
-        current.open
-  };
-}
+  // قیمت نسبت به EMA
+  if (price > e20) bull += 8;
+  else bear += 8;
 
-// --------------------------------------------------
-// شکست
-// --------------------------------------------------
+  // EMA 200
+  if (price > e200) bull += 8;
+  else bear += 8;
 
-function breakoutAnalysis(
-  candles
-) {
-  if (
-    candles.length < 25
-  ) {
-    return {
-      bullish: false,
-      bearish: false,
-      falseBreakoutBull: false,
-      falseBreakoutBear: false
-    };
+  // RSI
+  if (rsiValue >= 52 && rsiValue <= 70) {
+    bull += 12;
   }
 
-  const current =
-    candles[
-      candles.length - 1
-    ];
-
-  const previous =
-    candles.slice(
-      -21,
-      -1
-    );
-
-  const high =
-    Math.max(
-      ...previous.map(
-        c => c.high
-      )
-    );
-
-  const low =
-    Math.min(
-      ...previous.map(
-        c => c.low
-      )
-    );
-
-  return {
-    bullish:
-      current.close >
-      high,
-
-    bearish:
-      current.close <
-      low,
-
-    falseBreakoutBull:
-      current.high >
-        high &&
-      current.close <
-        high,
-
-    falseBreakoutBear:
-      current.low <
-        low &&
-      current.close >
-        low
-  };
-}
-
-// --------------------------------------------------
-// الگوهای کندلی
-// --------------------------------------------------
-
-function candlePatterns(
-  candles
-) {
-  if (
-    candles.length < 5
-  ) {
-    return {
-      bullish: [],
-      bearish: [],
-      scoreLong: 0,
-      scoreShort: 0
-    };
+  if (rsiValue <= 48 && rsiValue >= 30) {
+    bear += 12;
   }
 
-  const c =
-    candles[
-      candles.length - 1
-    ];
-
-  const p =
-    candles[
-      candles.length - 2
-    ];
-
-  const body =
-    Math.abs(
-      c.close -
-      c.open
-    );
-
-  const range =
-    c.high -
-    c.low;
-
-  const upper =
-    c.high -
-    Math.max(
-      c.open,
-      c.close
-    );
-
-  const lower =
-    Math.min(
-      c.open,
-      c.close
-    ) -
-    c.low;
-
-  const bullish = [];
-  const bearish = [];
-
-  let scoreLong = 0;
-  let scoreShort = 0;
-
-  // دوجی
+  // MACD
   if (
-    range > 0 &&
-    body / range < 0.1
+    macdLine != null &&
+    macdSignal != null
   ) {
-    bullish.push(
-      "دوجی"
-    );
+    if (macdLine > macdSignal) {
+      bull += 12;
+    } else {
+      bear += 12;
+    }
 
-    bearish.push(
-      "دوجی"
-    );
+    if (macdHistogram > 0) {
+      bull += 5;
+    } else {
+      bear += 5;
+    }
   }
 
-  // چکش
-  if (
-    range > 0 &&
-    lower >= body * 2 &&
-    upper <= body
-  ) {
-    bullish.push(
-      "چکش"
-    );
+  // ساختار
+  if (structure === "صعودی") bull += 12;
+  if (structure === "نزولی") bear += 12;
 
-    scoreLong += 5;
+  // حجم
+  if (volumeRatio >= 1.3) {
+    if (price > e20) bull += 6;
+    else bear += 6;
   }
 
-  // شوتینگ استار
-  if (
-    range > 0 &&
-    upper >= body * 2 &&
-    lower <= body
-  ) {
-    bearish.push(
-      "شوتینگ‌استار"
-    );
+  // نزدیک مقاومت/حمایت
+  const resistanceDistance =
+    sr.resistance > 0
+      ? ((sr.resistance - price) / price) * 100
+      : 999;
 
-    scoreShort += 5;
-  }
+  const supportDistance =
+    sr.support > 0
+      ? ((price - sr.support) / price) * 100
+      : 999;
 
-  // پوشای صعودی
-  if (
-    p.close < p.open &&
-    c.close > c.open &&
-    c.open <= p.close &&
-    c.close >= p.open
-  ) {
-    bullish.push(
-      "پوشای صعودی"
-    );
+  const patterns = candlePatterns(candles);
 
-    scoreLong += 8;
-  }
+  for (const pattern of patterns) {
+    if (
+      pattern.includes("صعودی") ||
+      pattern === "چکش"
+    ) {
+      bull += 5;
+    }
 
-  // پوشای نزولی
-  if (
-    p.close > p.open &&
-    c.close < c.open &&
-    c.open >= p.close &&
-    c.close <= p.open
-  ) {
-    bearish.push(
-      "پوشای نزولی"
-    );
-
-    scoreShort += 8;
-  }
-
-  // پین‌بار صعودی
-  if (
-    lower >=
-      body * 2.5 &&
-    lower >
-      upper * 1.5
-  ) {
-    bullish.push(
-      "پین‌بار صعودی"
-    );
-
-    scoreLong += 4;
-  }
-
-  // پین‌بار نزولی
-  if (
-    upper >=
-      body * 2.5 &&
-    upper >
-      lower * 1.5
-  ) {
-    bearish.push(
-      "پین‌بار نزولی"
-    );
-
-    scoreShort += 4;
+    if (
+      pattern.includes("نزولی") ||
+      pattern === "شهاب‌سنگ"
+    ) {
+      bear += 5;
+    }
   }
 
   return {
-    bullish,
-    bearish,
-    scoreLong,
-    scoreShort
+    price,
+    ema20: e20,
+    ema50: e50,
+    ema200: e200,
+    rsi: rsiValue,
+    atr: atrValue,
+    macd: macdLine,
+    macdSignal,
+    macdHistogram,
+    volumeRatio,
+    structure,
+    support: sr.support,
+    resistance: sr.resistance,
+    resistanceDistance,
+    supportDistance,
+    patterns,
+    bull,
+    bear
   };
 }
 
-// --------------------------------------------------
-// ساختار بازار
-// --------------------------------------------------
+// ============================================================
+// تحلیل چند تایم‌فریم
+// ============================================================
 
-function marketStructure(
-  candles
-) {
-  if (
-    candles.length < 12
-  ) {
-    return {
-      bullish: false,
-      bearish: false,
-      scoreLong: 0,
-      scoreShort: 0
-    };
-  }
+function combineAnalysis(a15, a1h, a4h) {
+  let bull = 0;
+  let bear = 0;
 
-  const recent =
-    candles.slice(-12);
+  // 4H مهم‌تر
+  bull += a4h.bull * 0.45;
+  bear += a4h.bear * 0.45;
 
-  const mid =
-    Math.floor(
-      recent.length / 2
-    );
+  // 1H
+  bull += a1h.bull * 0.35;
+  bear += a1h.bear * 0.35;
 
-  const first =
-    recent.slice(
-      0,
-      mid
-    );
+  // 15M
+  bull += a15.bull * 0.20;
+  bear += a15.bear * 0.20;
 
-  const second =
-    recent.slice(
-      mid
-    );
+  const total = bull + bear;
 
-  const high1 =
-    Math.max(
-      ...first.map(
-        c => c.high
-      )
-    );
-
-  const high2 =
-    Math.max(
-      ...second.map(
-        c => c.high
-      )
-    );
-
-  const low1 =
-    Math.min(
-      ...first.map(
-        c => c.low
-      )
-    );
-
-  const low2 =
-    Math.min(
-      ...second.map(
-        c => c.low
-      )
-    );
-
-  let scoreLong = 0;
-  let scoreShort = 0;
+  let direction = "خنثی";
 
   if (
-    high2 > high1 &&
-    low2 > low1
+    bull > bear &&
+    bull - bear >= 8
   ) {
-    scoreLong = 8;
+    direction = "خرید";
   }
 
   if (
-    high2 < high1 &&
-    low2 < low1
+    bear > bull &&
+    bear - bull >= 8
   ) {
-    scoreShort = 8;
+    direction = "فروش";
   }
+
+  const score =
+    total > 0
+      ? Math.round(
+          (Math.max(bull, bear) / total) * 100
+        )
+      : 0;
 
   return {
-    bullish:
-      scoreLong > 0,
-
-    bearish:
-      scoreShort > 0,
-
-    scoreLong,
-    scoreShort
+    direction,
+    score,
+    bull,
+    bear
   };
 }
 
-// --------------------------------------------------
-// BTC Context
-// --------------------------------------------------
+// ============================================================
+// داده‌های مشتقه
+// ============================================================
+
+async function getFunding(symbol) {
+  try {
+    const data = await fetchJson(
+      `${BASE_URL}/api/v1/futures/fundingRate?symbol=${encodeURIComponent(symbol)}`
+    );
+
+    const item =
+      data?.data ??
+      data?.result ??
+      data;
+
+    if (Array.isArray(item)) {
+      return safeNumber(
+        item[0]?.fundingRate ??
+        item[0]?.rate
+      );
+    }
+
+    return safeNumber(
+      item?.fundingRate ??
+      item?.rate
+    );
+  } catch (error) {
+    console.error("Funding error", symbol, error);
+    return null;
+  }
+}
+
+async function getOpenInterest(symbol) {
+  try {
+    const data = await fetchJson(
+      `${BASE_URL}/quote/v1/openInterest?symbol=${encodeURIComponent(symbol)}`
+    );
+
+    const item =
+      data?.data ??
+      data?.result ??
+      data;
+
+    if (Array.isArray(item)) {
+      return safeNumber(
+        item[0]?.openInterest ??
+        item[0]?.value
+      );
+    }
+
+    return safeNumber(
+      item?.openInterest ??
+      item?.value
+    );
+  } catch (error) {
+    console.error("OI error", symbol, error);
+    return null;
+  }
+}
+
+async function getLongShort(symbol) {
+  try {
+    const data = await fetchJson(
+      `${BASE_URL}/quote/v1/globalLongShortAccountRatio` +
+      `?symbol=${encodeURIComponent(symbol)}` +
+      `&period=1h&limit=1`
+    );
+
+    const item =
+      data?.data ??
+      data?.result ??
+      data;
+
+    if (Array.isArray(item)) {
+      return safeNumber(
+        item[0]?.longShortRatio ??
+        item[0]?.ratio
+      );
+    }
+
+    return safeNumber(
+      item?.longShortRatio ??
+      item?.ratio
+    );
+  } catch (error) {
+    console.error("LongShort error", symbol, error);
+    return null;
+  }
+}
+
+// ============================================================
+// تحلیل BTC
+// ============================================================
 
 async function getBTCContext() {
   try {
-    log(
-      "تحلیل وضعیت BTC..."
-    );
-
-    const candles =
-      await getKlines(
-        "BTC-SWAP-USDT",
-        "1h",
-        100
-      );
-
-    const trend =
-      getTrend(candles);
-
-    const rsi =
-      calculateRSI(
-        candles.map(
-          c => c.close
-        )
-      );
-
-    return {
-      trend,
-      rsi
-    };
-  } catch (error) {
-    log(
-      "BTC Context ناموفق",
-      error.message
-    );
-
-    return {
-      trend: "نامشخص",
-      rsi: 50
-    };
-  }
-}
-
-// --------------------------------------------------
-// تحلیل یک نماد
-// --------------------------------------------------
-
-async function analyzeSymbol(
-  symbol,
-  btcContext
-) {
-  log(
-    `شروع تحلیل ${symbol}`
-  );
-
-  const results =
-    await Promise.allSettled([
-      getKlines(
-        symbol,
-        "15m",
-        100
-      ),
-
-      getKlines(
-        symbol,
-        "1h",
-        160
-      ),
-
-      getKlines(
-        symbol,
-        "4h",
-        160
-      ),
-
-      getFundingRate(
-        symbol
-      ),
-
-      getOpenInterest(
-        symbol
-      ),
-
-      getLongShortRatio(
-        symbol
-      )
+    const [h1, h4] = await Promise.all([
+      getKlines("BTC-SWAP-USDT", "1h", 100),
+      getKlines("BTC-SWAP-USDT", "4h", 100)
     ]);
 
-  const [
-    m15Result,
-    h1Result,
-    h4Result,
-    fundingResult,
-    oiResult,
-    ratioResult
-  ] = results;
+    const a1 = analyzeTimeframe(h1);
+    const a4 = analyzeTimeframe(h4);
 
-  if (
-    h1Result.status !==
-      "fulfilled" ||
-    h4Result.status !==
-      "fulfilled"
-  ) {
-    throw new Error(
-      `کندل کافی برای ${symbol}`
+    return combineAnalysis(
+      a1,
+      a1,
+      a4
     );
-  }
-
-  const h1 =
-    h1Result.value;
-
-  const h4 =
-    h4Result.value;
-
-  const m15 =
-    m15Result.status ===
-    "fulfilled"
-      ? m15Result.value
-      : h1;
-
-  if (
-    h1.length < 50 ||
-    h4.length < 50
-  ) {
-    throw new Error(
-      `تعداد کندل کم برای ${symbol}`
-    );
-  }
-
-  const price =
-    h1[
-      h1.length - 1
-    ].close;
-
-  const trend15 =
-    getTrend(m15);
-
-  const trend1 =
-    getTrend(h1);
-
-  const trend4 =
-    getTrend(h4);
-
-  const closes =
-    h1.map(
-      c => c.close
-    );
-
-  const rsi =
-    calculateRSI(
-      closes
-    );
-
-  const macd =
-    calculateMACD(
-      closes
-    );
-
-  const atr =
-    calculateATR(
-      h1
-    );
-
-  const adx =
-    calculateADX(
-      h1
-    );
-
-  const volume =
-    volumeAnalysis(
-      h1
-    );
-
-  const breakout =
-    breakoutAnalysis(
-      h1
-    );
-
-  const structure =
-    marketStructure(
-      h1
-    );
-
-  const patterns =
-    candlePatterns(
-      h1
-    );
-
-  const levels =
-    getSupportResistance(
-      h1
-    );
-
-  const funding =
-    fundingResult.status ===
-    "fulfilled"
-      ? fundingResult.value
-      : 0;
-
-  const openInterest =
-    oiResult.status ===
-    "fulfilled"
-      ? oiResult.value
-      : 0;
-
-  const longShortRatio =
-    ratioResult.status ===
-    "fulfilled"
-      ? ratioResult.value
-      : 1;
-
-  let longScore = 0;
-  let shortScore = 0;
-
-  // ------------------------------------------------
-  // روند 4 ساعته
-  // ------------------------------------------------
-
-  if (
-    trend4 ===
-    "صعودی قوی"
-  ) {
-    longScore += 20;
-  } else if (
-    trend4 ===
-    "صعودی"
-  ) {
-    longScore += 14;
-  } else if (
-    trend4 ===
-    "نزولی قوی"
-  ) {
-    shortScore += 20;
-  } else if (
-    trend4 ===
-    "نزولی"
-  ) {
-    shortScore += 14;
-  }
-
-  // ------------------------------------------------
-  // روند 1 ساعته
-  // ------------------------------------------------
-
-  if (
-    trend1 ===
-    "صعودی قوی"
-  ) {
-    longScore += 18;
-  } else if (
-    trend1 ===
-    "صعودی"
-  ) {
-    longScore += 13;
-  } else if (
-    trend1 ===
-    "نزولی قوی"
-  ) {
-    shortScore += 18;
-  } else if (
-    trend1 ===
-    "نزولی"
-  ) {
-    shortScore += 13;
-  }
-
-  // ------------------------------------------------
-  // روند 15 دقیقه
-  // ------------------------------------------------
-
-  if (
-    trend15.includes(
-      "صعودی"
-    )
-  ) {
-    longScore += 8;
-  }
-
-  if (
-    trend15.includes(
-      "نزولی"
-    )
-  ) {
-    shortScore += 8;
-  }
-
-  // ------------------------------------------------
-  // RSI
-  // ------------------------------------------------
-
-  if (
-    rsi >= 52 &&
-    rsi <= 68
-  ) {
-    longScore += 8;
-  }
-
-  if (
-    rsi >= 32 &&
-    rsi <= 48
-  ) {
-    shortScore += 8;
-  }
-
-  // ------------------------------------------------
-  // MACD
-  // ------------------------------------------------
-
-  if (
-    macd.histogram > 0
-  ) {
-    longScore += 7;
-  }
-
-  if (
-    macd.histogram < 0
-  ) {
-    shortScore += 7;
-  }
-
-  // ------------------------------------------------
-  // ADX
-  // ------------------------------------------------
-
-  if (
-    adx >= 25
-  ) {
-    if (
-      trend1.includes(
-        "صعودی"
-      )
-    ) {
-      longScore += 7;
-    }
-
-    if (
-      trend1.includes(
-        "نزولی"
-      )
-    ) {
-      shortScore += 7;
-    }
-  }
-
-  // ------------------------------------------------
-  // حجم
-  // ------------------------------------------------
-
-  if (
-    volume.bullish
-  ) {
-    longScore += 6;
-  }
-
-  if (
-    volume.bearish
-  ) {
-    shortScore += 6;
-  }
-
-  // ------------------------------------------------
-  // شکست
-  // ------------------------------------------------
-
-  if (
-    breakout.bullish
-  ) {
-    longScore += 8;
-
-    if (
-      volume.ratio >= 1.2
-    ) {
-      longScore += 4;
-    }
-  }
-
-  if (
-    breakout.bearish
-  ) {
-    shortScore += 8;
-
-    if (
-      volume.ratio >= 1.2
-    ) {
-      shortScore += 4;
-    }
-  }
-
-  // ------------------------------------------------
-  // شکست جعلی
-  // ------------------------------------------------
-
-  if (
-    breakout.falseBreakoutBull
-  ) {
-    shortScore += 5;
-  }
-
-  if (
-    breakout.falseBreakoutBear
-  ) {
-    longScore += 5;
-  }
-
-  // ------------------------------------------------
-  // ساختار بازار
-  // ------------------------------------------------
-
-  longScore +=
-    structure.scoreLong;
-
-  shortScore +=
-    structure.scoreShort;
-
-  // ------------------------------------------------
-  // الگوهای کندلی
-  // ------------------------------------------------
-
-  longScore +=
-    patterns.scoreLong;
-
-  shortScore +=
-    patterns.scoreShort;
-
-  // ------------------------------------------------
-  // BTC Context
-  // ------------------------------------------------
-
-  if (
-    symbol !==
-    "BTC-SWAP-USDT"
-  ) {
-    if (
-      btcContext.trend.includes(
-        "نزولی"
-      )
-    ) {
-      longScore -= 5;
-    }
-
-    if (
-      btcContext.trend.includes(
-        "صعودی"
-      )
-    ) {
-      longScore += 3;
-    }
-
-    if (
-      btcContext.trend.includes(
-        "صعودی"
-      )
-    ) {
-      shortScore -= 3;
-    }
-
-    if (
-      btcContext.trend.includes(
-        "نزولی"
-      )
-    ) {
-      shortScore += 3;
-    }
-  }
-
-  // ------------------------------------------------
-  // Funding
-  // ------------------------------------------------
-
-  if (
-    funding > 0.0015
-  ) {
-    shortScore += 4;
-  }
-
-  if (
-    funding < -0.0015
-  ) {
-    longScore += 4;
-  }
-
-  // ------------------------------------------------
-  // Long / Short
-  // ------------------------------------------------
-
-  if (
-    longShortRatio > 1.6
-  ) {
-    shortScore += 3;
-  }
-
-  if (
-    longShortRatio < 0.65
-  ) {
-    longScore += 3;
-  }
-
-  // ------------------------------------------------
-  // محدود کردن امتیاز
-  // ------------------------------------------------
-
-  longScore =
-    Math.max(
-      0,
-      Math.min(
-        100,
-        Math.round(
-          longScore
-        )
-      )
-    );
-
-  shortScore =
-    Math.max(
-      0,
-      Math.min(
-        100,
-        Math.round(
-          shortScore
-        )
-      )
-    );
-
-  const bestScore =
-    Math.max(
-      longScore,
-      shortScore
-    );
-
-  let signal =
-    "بدون سیگنال";
-
-  if (
-    longScore >=
-      MIN_SIGNAL_SCORE &&
-    longScore >
-      shortScore + 8
-  ) {
-    signal =
-      "فرصت خرید";
-  }
-
-  if (
-    shortScore >=
-      MIN_SIGNAL_SCORE &&
-    shortScore >
-      longScore + 8
-  ) {
-    signal =
-      "فرصت فروش";
-  }
-
-  // ------------------------------------------------
-  // مدیریت معامله
-  // ------------------------------------------------
-
-  let stop = null;
-  let tp1 = null;
-  let tp2 = null;
-  let tp3 = null;
-
-  let riskPerUnit = 0;
-
-  if (
-    signal ===
-      "فرصت خرید" &&
-    atr > 0
-  ) {
-    stop =
-      price -
-      atr * 1.2;
-
-    riskPerUnit =
-      price -
-      stop;
-
-    tp1 =
-      price +
-      riskPerUnit *
-        1.2;
-
-    tp2 =
-      price +
-      riskPerUnit *
-        2;
-
-    tp3 =
-      price +
-      riskPerUnit *
-        3;
-  }
-
-  if (
-    signal ===
-      "فرصت فروش" &&
-    atr > 0
-  ) {
-    stop =
-      price +
-      atr * 1.2;
-
-    riskPerUnit =
-      stop -
-      price;
-
-    tp1 =
-      price -
-      riskPerUnit *
-        1.2;
-
-    tp2 =
-      price -
-      riskPerUnit *
-        2;
-
-    tp3 =
-      price -
-      riskPerUnit *
-        3;
-  }
-
-  // ------------------------------------------------
-  // اندازه معامله
-  // ------------------------------------------------
-
-  const maxLoss =
-    PAPER_BUDGET *
-    (
-      RISK_PERCENT /
-      100
-    );
-
-  let positionSize = 0;
-
-  if (
-    riskPerUnit > 0
-  ) {
-    positionSize =
-      maxLoss /
-      riskPerUnit;
-  }
-
-  // ------------------------------------------------
-  // لوریج
-  // ------------------------------------------------
-
-  let leverage = 1;
-
-  if (
-    signal !==
-    "بدون سیگنال"
-  ) {
-    const volatility =
-      atr / price;
-
-    if (
-      volatility < 0.008
-    ) {
-      leverage = 5;
-    } else if (
-      volatility < 0.015
-    ) {
-      leverage = 4;
-    } else if (
-      volatility < 0.03
-    ) {
-      leverage = 3;
-    } else {
-      leverage = 2;
-    }
-  }
-
-  const result = {
-    symbol,
-    price,
-
-    signal,
-
-    longScore,
-    shortScore,
-    bestScore,
-
-    trend15,
-    trend1,
-    trend4,
-
-    rsi,
-    adx,
-
-    macdHistogram:
-      macd.histogram,
-
-    volumeRatio:
-      volume.ratio,
-
-    support:
-      levels.support,
-
-    resistance:
-      levels.resistance,
-
-    atr,
-
-    candleBullish:
-      patterns.bullish,
-
-    candleBearish:
-      patterns.bearish,
-
-    marketStructure:
-      structure.bullish
-        ? "صعودی"
-        : structure.bearish
-        ? "نزولی"
-        : "خنثی",
-
-    breakoutBullish:
-      breakout.bullish,
-
-    breakoutBearish:
-      breakout.bearish,
-
-    falseBreakoutBull:
-      breakout.falseBreakoutBull,
-
-    falseBreakoutBear:
-      breakout.falseBreakoutBear,
-
-    fundingRate:
-      funding,
-
-    openInterest,
-
-    longShortRatio,
-
-    btcTrend:
-      btcContext.trend,
-
-    btcRSI:
-      btcContext.rsi,
-
-    stop,
-    tp1,
-    tp2,
-    tp3,
-
-    positionSize,
-    leverage
-  };
-
-  log(
-    `پایان تحلیل ${symbol}`,
-    `Score=${bestScore} Signal=${signal}`
-  );
-
-  return result;
-}
-
-// --------------------------------------------------
-// فرمت قیمت
-// --------------------------------------------------
-
-function formatPrice(
-  value
-) {
-  if (
-    value === null ||
-    value === undefined ||
-    Number.isNaN(value)
-  ) {
-    return "—";
-  }
-
-  if (value >= 1000) {
-    return value.toLocaleString(
-      "en-US",
-      {
-        maximumFractionDigits: 2
-      }
-    );
-  }
-
-  if (value >= 1) {
-    return value.toFixed(4);
-  }
-
-  if (value >= 0.01) {
-    return value.toFixed(6);
-  }
-
-  return value.toFixed(8);
-}
-
-// --------------------------------------------------
-// درصد
-// --------------------------------------------------
-
-function formatPercent(
-  value
-) {
-  return (
-    (
-      Number(value) *
-      100
-    ).toFixed(3) +
-    "%"
-  );
-}
-
-// --------------------------------------------------
-// KV
-// --------------------------------------------------
-
-function getKV(env) {
-  if (
-    !env.ALGO_ESMAIL_KV
-  ) {
-    throw new Error(
-      "KV متصل نیست"
-    );
-  }
-
-  return env.ALGO_ESMAIL_KV;
-}
-
-// --------------------------------------------------
-// Chat
-// --------------------------------------------------
-
-async function saveChat(
-  env,
-  chatId
-) {
-  const kv =
-    getKV(env);
-
-  await kv.put(
-    `chat:${chatId}`,
-    "active"
-  );
-}
-
-async function removeChat(
-  env,
-  chatId
-) {
-  const kv =
-    getKV(env);
-
-  await kv.delete(
-    `chat:${chatId}`
-  );
-}
-
-async function getSubscribedChats(
-  env
-) {
-  const kv =
-    getKV(env);
-
-  const list =
-    await kv.list({
-      prefix: "chat:"
-    });
-
-  return list.keys.map(
-    key =>
-      key.name.replace(
-        "chat:",
-        ""
-      )
-  );
-}
-
-// --------------------------------------------------
-// معامله باز
-// --------------------------------------------------
-
-async function getOpenTrade(
-  env,
-  symbol
-) {
-  const kv =
-    getKV(env);
-
-  const list =
-    await kv.list({
-      prefix: "trade:"
-    });
-
-  for (
-    const key of list.keys
-  ) {
-    const raw =
-      await kv.get(
-        key.name
-      );
-
-    if (!raw) {
-      continue;
-    }
-
-    try {
-      const trade =
-        JSON.parse(raw);
-
-      if (
-        trade.symbol ===
-          symbol &&
-        trade.status ===
-          "open"
-      ) {
-        return trade;
-      }
-    } catch {}
-  }
-
-  return null;
-}
-
-// --------------------------------------------------
-// Paper Trade
-// --------------------------------------------------
-
-async function savePaperTrade(
-  env,
-  result
-) {
-  if (
-    result.signal ===
-    "بدون سیگنال"
-  ) {
-    return null;
-  }
-
-  const existing =
-    await getOpenTrade(
-      env,
-      result.symbol
-    );
-
-  if (existing) {
-    return existing;
-  }
-
-  const kv =
-    getKV(env);
-
-  const id =
-    `${Date.now()}-${result.symbol}`;
-
-  const trade = {
-    id,
-
-    time:
-      new Date().toISOString(),
-
-    symbol:
-      result.symbol,
-
-    direction:
-      result.signal,
-
-    entry:
-      result.price,
-
-    stop:
-      result.stop,
-
-    tp1:
-      result.tp1,
-
-    tp2:
-      result.tp2,
-
-    tp3:
-      result.tp3,
-
-    score:
-      result.bestScore,
-
-    leverage:
-      result.leverage,
-
-    positionSize:
-      result.positionSize,
-
-    riskAmount:
-      PAPER_BUDGET *
-      (
-        RISK_PERCENT /
-        100
-      ),
-
-    status:
-      "open",
-
-    target1Hit:
-      false,
-
-    target2Hit:
-      false,
-
-    target3Hit:
-      false,
-
-    maxFavorable:
-      0,
-
-    maxAdverse:
-      0,
-
-    factors: {
-      trend15:
-        result.trend15,
-
-      trend1:
-        result.trend1,
-
-      trend4:
-        result.trend4,
-
-      rsi:
-        result.rsi,
-
-      adx:
-        result.adx,
-
-      macdHistogram:
-        result.macdHistogram,
-
-      volumeRatio:
-        result.volumeRatio,
-
-      fundingRate:
-        result.fundingRate,
-
-      longShortRatio:
-        result.longShortRatio,
-
-      candleBullish:
-        result.candleBullish,
-
-      candleBearish:
-        result.candleBearish,
-
-      marketStructure:
-        result.marketStructure,
-
-      breakoutBullish:
-        result.breakoutBullish,
-
-      breakoutBearish:
-        result.breakoutBearish
-    }
-  };
-
-  await kv.put(
-    `trade:${id}`,
-    JSON.stringify(trade)
-  );
-
-  return trade;
-}
-
-// --------------------------------------------------
-// بررسی معاملات
-// --------------------------------------------------
-
-async function updatePaperTrades(
-  env
-) {
-  const kv =
-    getKV(env);
-
-  const list =
-    await kv.list({
-      prefix: "trade:"
-    });
-
-  let updated = 0;
-
-  for (
-    const key of list.keys
-  ) {
-    const raw =
-      await kv.get(
-        key.name
-      );
-
-    if (!raw) {
-      continue;
-    }
-
-    let trade;
-
-    try {
-      trade =
-        JSON.parse(raw);
-    } catch {
-      continue;
-    }
-
-    if (
-      trade.status !==
-      "open"
-    ) {
-      continue;
-    }
-
-    try {
-      const candles =
-        await getKlines(
-          trade.symbol,
-          "1m",
-          3
-        );
-
-      if (
-        !candles.length
-      ) {
-        continue;
-      }
-
-      const latest =
-        candles[
-          candles.length - 1
-        ];
-
-      const price =
-        latest.close;
-
-      let favorable = 0;
-      let adverse = 0;
-
-      if (
-        trade.direction ===
-        "فرصت خرید"
-      ) {
-        favorable =
-          Math.max(
-            0,
-            price -
-              trade.entry
-          );
-
-        adverse =
-          Math.max(
-            0,
-            trade.entry -
-              price
-          );
-      } else {
-        favorable =
-          Math.max(
-            0,
-            trade.entry -
-              price
-          );
-
-        adverse =
-          Math.max(
-            0,
-            price -
-              trade.entry
-          );
-      }
-
-      trade.maxFavorable =
-        Math.max(
-          trade.maxFavorable ||
-            0,
-          favorable
-        );
-
-      trade.maxAdverse =
-        Math.max(
-          trade.maxAdverse ||
-            0,
-          adverse
-        );
-
-      let result =
-        null;
-
-      // ------------------------------
-      // Long
-      // ------------------------------
-
-      if (
-        trade.direction ===
-        "فرصت خرید"
-      ) {
-        if (
-          latest.low <=
-          trade.stop
-        ) {
-          result = {
-            status: "loss",
-            exit:
-              trade.stop,
-            reason:
-              "حد ضرر"
-          };
-        } else if (
-          latest.high >=
-          trade.tp3
-        ) {
-          result = {
-            status: "win",
-            exit:
-              trade.tp3,
-            reason:
-              "هدف سوم"
-          };
-        } else if (
-          latest.high >=
-          trade.tp2
-        ) {
-          trade.target2Hit =
-            true;
-        } else if (
-          latest.high >=
-          trade.tp1
-        ) {
-          trade.target1Hit =
-            true;
-        }
-      }
-
-      // ------------------------------
-      // Short
-      // ------------------------------
-
-      if (
-        trade.direction ===
-        "فرصت فروش"
-      ) {
-        if (
-          latest.high >=
-          trade.stop
-        ) {
-          result = {
-            status: "loss",
-            exit:
-              trade.stop,
-            reason:
-              "حد ضرر"
-          };
-        } else if (
-          latest.low <=
-          trade.tp3
-        ) {
-          result = {
-            status: "win",
-            exit:
-              trade.tp3,
-            reason:
-              "هدف سوم"
-          };
-        } else if (
-          latest.low <=
-          trade.tp2
-        ) {
-          trade.target2Hit =
-            true;
-        } else if (
-          latest.low <=
-          trade.tp1
-        ) {
-          trade.target1Hit =
-            true;
-        }
-      }
-
-      if (result) {
-        trade.status =
-          result.status;
-
-        trade.exit =
-          result.exit;
-
-        trade.reason =
-          result.reason;
-
-        trade.closeTime =
-          new Date().toISOString();
-
-        if (
-          trade.direction ===
-          "فرصت خرید"
-        ) {
-          trade.pnl =
-            (
-              result.exit -
-              trade.entry
-            ) *
-            trade.positionSize *
-            trade.leverage;
-        } else {
-          trade.pnl =
-            (
-              trade.entry -
-              result.exit
-            ) *
-            trade.positionSize *
-            trade.leverage;
-        }
-
-        trade.pnlPercent =
-          (
-            trade.pnl /
-            PAPER_BUDGET
-          ) *
-          100;
-      }
-
-      await kv.put(
-        key.name,
-        JSON.stringify(
-          trade
-        )
-      );
-
-      updated++;
-
-    } catch (error) {
-      log(
-        `خطای پیگیری ${trade.symbol}`,
-        error.message
-      );
-    }
-  }
-
-  return updated;
-}
-
-// --------------------------------------------------
-// آمار معاملات
-// --------------------------------------------------
-
-async function getTradeStats(
-  env
-) {
-  const kv =
-    getKV(env);
-
-  const list =
-    await kv.list({
-      prefix: "trade:"
-    });
-
-  const trades = [];
-
-  for (
-    const key of list.keys
-  ) {
-    const raw =
-      await kv.get(
-        key.name
-      );
-
-    if (!raw) {
-      continue;
-    }
-
-    try {
-      trades.push(
-        JSON.parse(raw)
-      );
-    } catch {}
-  }
-
-  const closed =
-    trades.filter(
-      t =>
-        t.status ===
-          "win" ||
-        t.status ===
-          "loss"
-    );
-
-  const wins =
-    closed.filter(
-      t =>
-        t.status ===
-        "win"
-    );
-
-  const losses =
-    closed.filter(
-      t =>
-        t.status ===
-        "loss"
-    );
-
-  const pnl =
-    closed.reduce(
-      (sum, t) =>
-        sum +
-        Number(
-          t.pnl || 0
-        ),
-      0
-    );
-
-  const winRate =
-    closed.length
-      ? (
-          wins.length /
-          closed.length
-        ) *
-        100
-      : 0;
-
-  const groups = {
-    "70-79": [],
-    "80-89": [],
-    "90-100": []
-  };
-
-  for (
-    const t of closed
-  ) {
-    if (
-      t.score >= 70 &&
-      t.score < 80
-    ) {
-      groups[
-        "70-79"
-      ].push(t);
-    } else if (
-      t.score >= 80 &&
-      t.score < 90
-    ) {
-      groups[
-        "80-89"
-      ].push(t);
-    } else if (
-      t.score >= 90
-    ) {
-      groups[
-        "90-100"
-      ].push(t);
-    }
-  }
-
-  const groupStats = {};
-
-  for (
-    const [
-      name,
-      arr
-    ] of Object.entries(
-      groups
-    )
-  ) {
-    const gwins =
-      arr.filter(
-        t =>
-          t.status ===
-          "win"
-      ).length;
-
-    groupStats[name] = {
-      count:
-        arr.length,
-
-      winRate:
-        arr.length
-          ? (
-              gwins /
-              arr.length
-            ) *
-            100
-          : 0
+  } catch (error) {
+    console.error("BTC context error", error);
+
+    return {
+      direction: "خنثی",
+      score: 0,
+      bull: 0,
+      bear: 0
     };
   }
-
-  return {
-    total:
-      trades.length,
-
-    open:
-      trades.filter(
-        t =>
-          t.status ===
-          "open"
-      ).length,
-
-    closed:
-      closed.length,
-
-    wins:
-      wins.length,
-
-    losses:
-      losses.length,
-
-    winRate,
-
-    pnl,
-
-    groupStats
-  };
 }
 
-// --------------------------------------------------
-// گزارش آمار
-// --------------------------------------------------
+// ============================================================
+// تحلیل یک ارز
+// ============================================================
 
-async function makeStatsReport(
-  env
-) {
-  const stats =
-    await getTradeStats(
-      env
+async function analyzeSymbol(item) {
+  const symbol = item.symbol;
+
+  try {
+    // سه تایم‌فریم به صورت همزمان
+    const results = await Promise.allSettled([
+      getKlines(symbol, "15m", 100),
+      getKlines(symbol, "1h", 120),
+      getKlines(symbol, "4h", 120)
+    ]);
+
+    if (
+      results[0].status !== "fulfilled" ||
+      results[1].status !== "fulfilled" ||
+      results[2].status !== "fulfilled"
+    ) {
+      throw new Error("دریافت یکی از تایم‌فریم‌ها ناموفق بود.");
+    }
+
+    const candles15 = results[0].value;
+    const candles1h = results[1].value;
+    const candles4h = results[2].value;
+
+    const a15 = analyzeTimeframe(candles15);
+    const a1h = analyzeTimeframe(candles1h);
+    const a4h = analyzeTimeframe(candles4h);
+
+    const combined = combineAnalysis(
+      a15,
+      a1h,
+      a4h
     );
 
-  return `
-📊 *گزارش عملکرد Algo Esmail*
+    return {
+      ...item,
+      symbol,
+      price: a1h.price,
+      analysis15: a15,
+      analysis1h: a1h,
+      analysis4h: a4h,
+      ...combined
+    };
+  } catch (error) {
+    console.error(
+      "Symbol analysis error",
+      symbol,
+      error
+    );
 
-📁 کل معاملات:
-${stats.total}
-
-🟡 باز:
-${stats.open}
-
-📕 بسته‌شده:
-${stats.closed}
-
-🟢 موفق:
-${stats.wins}
-
-🔴 ناموفق:
-${stats.losses}
-
-🎯 نرخ موفقیت:
-${stats.winRate.toFixed(1)}٪
-
-💰 سود/ضرر فرضی:
-${stats.pnl.toFixed(2)} USDT
-
-━━━━━━━━━━━━━━
-
-📈 عملکرد بر اساس امتیاز
-
-⭐ 70 تا 79:
-${stats.groupStats["70-79"].count} معامله
-موفقیت:
-${stats.groupStats["70-79"].winRate.toFixed(1)}٪
-
-⭐ 80 تا 89:
-${stats.groupStats["80-89"].count} معامله
-موفقیت:
-${stats.groupStats["80-89"].winRate.toFixed(1)}٪
-
-⭐ 90 تا 100:
-${stats.groupStats["90-100"].count} معامله
-موفقیت:
-${stats.groupStats["90-100"].winRate.toFixed(1)}٪
-
-🧪 تمام نتایج آزمایشی هستند.
-`;
+    return {
+      ...item,
+      symbol,
+      failed: true,
+      error: error.message
+    };
+  }
 }
 
-// --------------------------------------------------
-// اسکن بازار
-// --------------------------------------------------
+// ============================================================
+// داده‌های عمیق برای گزینه‌های برتر
+// ============================================================
 
-async function scanMarket() {
-  const started =
-    Date.now();
+async function enrichDerivatives(results) {
+  const top = results
+    .filter(x =>
+      !x.failed &&
+      x.direction !== "خنثی"
+    )
+    .sort((a, b) => b.score - a.score)
+    .slice(0, SHORTLIST_FOR_DERIVATIVES);
 
-  log(
-    "========== شروع اسکن =========="
-  );
+  await Promise.all(
+    top.map(async item => {
+      const [
+        funding,
+        openInterest,
+        longShort
+      ] = await Promise.all([
+        getFunding(item.symbol),
+        getOpenInterest(item.symbol),
+        getLongShort(item.symbol)
+      ]);
 
-  const symbols =
-    await getBestSymbols();
+      item.funding = funding;
+      item.openInterest = openInterest;
+      item.longShort = longShort;
 
-  if (
-    !symbols.length
-  ) {
-    throw new Error(
-      "هیچ نماد فعالی برای اسکن پیدا نشد"
-    );
-  }
+      // تأثیر جزئی داده‌های مشتقه
+      if (funding != null) {
+        if (
+          item.direction === "خرید" &&
+          funding < 0.0005
+        ) {
+          item.score += 3;
+        }
 
-  log(
-    `تعداد ارزهای اسکن: ${symbols.length}`
-  );
+        if (
+          item.direction === "فروش" &&
+          funding > 0.0005
+        ) {
+          item.score += 3;
+        }
+      }
 
-  const btcContext =
-    await getBTCContext();
-
-  const results = [];
-
-  for (
-    let i = 0;
-    i < symbols.length;
-    i += ANALYSIS_BATCH
-  ) {
-    const batch =
-      symbols.slice(
-        i,
-        i +
-          ANALYSIS_BATCH
+      item.score = clamp(
+        Math.round(item.score),
+        0,
+        100
       );
-
-    log(
-      `Batch ${Math.floor(i / ANALYSIS_BATCH) + 1} شروع شد`,
-      batch.join(", ")
-    );
-
-    const batchResults =
-      await Promise.all(
-        batch.map(
-          async symbol => {
-            try {
-              return await analyzeSymbol(
-                symbol,
-                btcContext
-              );
-            } catch (error) {
-              log(
-                `خطا در تحلیل ${symbol}`,
-                error.message
-              );
-
-              return null;
-            }
-          }
-        )
-      );
-
-    results.push(
-      ...batchResults.filter(
-        Boolean
-      )
-    );
-
-    log(
-      `پیشرفت اسکن: ${results.length}/${symbols.length}`
-    );
-  }
-
-  results.sort(
-    (a, b) =>
-      b.bestScore -
-      a.bestScore
-  );
-
-  log(
-    `========== پایان اسکن | ${Date.now() - started}ms ==========`
+    })
   );
 
   return results;
 }
 
-// --------------------------------------------------
-// گزارش اسکن
-// --------------------------------------------------
+// ============================================================
+// مدیریت حجم کار
+// ============================================================
 
-function makeScanReport(
-  results
-) {
+async function runInBatches(items, batchSize, worker) {
+  const output = [];
+
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(
+      i,
+      i + batchSize
+    );
+
+    const results = await Promise.all(
+      batch.map(item => worker(item))
+    );
+
+    output.push(...results);
+  }
+
+  return output;
+}
+
+// ============================================================
+// Paper Trade
+// ============================================================
+
+function calculateTrade(result) {
   if (
-    !results.length
+    !result ||
+    result.failed ||
+    result.direction === "خنثی"
   ) {
-    return `
-❌ *اسکن انجام نشد*
-
-هیچ اطلاعات قابل استفاده‌ای از بازار دریافت نشد.
-`;
+    return null;
   }
 
-  let message = `
-🔎 *تحلیل بازار توبیت*
+  const entry = result.price;
 
-💵 بودجه آزمایشی:
-${PAPER_BUDGET} USDT
+  const atrValue =
+    result.analysis1h?.atr ||
+    entry * 0.01;
 
-📊 تعداد ارزهای بررسی‌شده:
-${results.length}
-
-`;
-
-  results
-    .slice(
-      0,
-      TOP_OPPORTUNITIES
-    )
-    .forEach(
-      (r, index) => {
-        let signal =
-          "⏳ بدون سیگنال";
-
-        if (
-          r.signal ===
-          "فرصت خرید"
-        ) {
-          signal =
-            "🟢 فرصت خرید";
-        }
-
-        if (
-          r.signal ===
-          "فرصت فروش"
-        ) {
-          signal =
-            "🔴 فرصت فروش";
-        }
-
-        message += `
-*${index + 1}. ${r.symbol}*
-
-${signal}
-
-⭐ امتیاز:
-${r.bestScore} از 100
-
-🟢 امتیاز خرید:
-${r.longScore}
-
-🔴 امتیاز فروش:
-${r.shortScore}
-
-📈 روند ۴ ساعته:
-${r.trend4}
-
-📈 روند ۱ ساعته:
-${r.trend1}
-
-⏱ روند ۱۵ دقیقه:
-${r.trend15}
-
-💪 قدرت روند:
-${r.adx.toFixed(1)}
-
-📊 شاخص قدرت بازار:
-${r.rsi.toFixed(1)}
-
-📊 حجم:
-${r.volumeRatio.toFixed(2)} برابر
-
-🕯️ الگوی کندلی:
-${
-  r.signal ===
-  "فرصت خرید"
-    ? (
-        r.candleBullish.join(
-          "، "
-        ) ||
-        "مورد مهمی دیده نشد"
-      )
-    : (
-        r.candleBearish.join(
-          "، "
-        ) ||
-        "مورد مهمی دیده نشد"
-      )
-}
-
-📐 ساختار بازار:
-${r.marketStructure}
-
-💸 نرخ تأمین:
-${formatPercent(
-  r.fundingRate
-)}
-
-👥 نسبت خریداران به فروشندگان:
-${r.longShortRatio.toFixed(2)}
-
-💰 قیمت:
-${formatPrice(
-  r.price
-)}
-`;
-
-        if (
-          r.signal !==
-          "بدون سیگنال"
-        ) {
-          message += `
-━━━━━━━━━━━━━━
-
-🎯 نقطه ورود:
-${formatPrice(
-  r.price
-)}
-
-🛑 حد ضرر:
-${formatPrice(
-  r.stop
-)}
-
-🎯 هدف اول:
-${formatPrice(
-  r.tp1
-)}
-
-🎯 هدف دوم:
-${formatPrice(
-  r.tp2
-)}
-
-🎯 هدف سوم:
-${formatPrice(
-  r.tp3
-)}
-
-💵 حجم پیشنهادی:
-${r.positionSize.toFixed(
-  4
-)}
-
-⚙️ لوریج آزمایشی:
-${r.leverage}x
-
-🧪 وضعیت:
-ثبت در معاملات آزمایشی
-`;
-        }
-
-        message +=
-          "\n━━━━━━━━━━━━━━\n";
-      }
+  const riskDistance =
+    Math.max(
+      atrValue * 1.5,
+      entry * 0.003
     );
 
-  message += `
-⚠️ معاملات این نسخه واقعی نیستند.
-`;
+  let stop;
+  let tp1;
+  let tp2;
+  let tp3;
 
-  return message;
-}
-
-// --------------------------------------------------
-// گزارش ساعتی
-// --------------------------------------------------
-
-function makeHourlyReport(
-  results
-) {
-  const strong =
-    results
-      .filter(
-        r =>
-          r.signal !==
-          "بدون سیگنال"
-      )
-      .slice(
-        0,
-        TOP_OPPORTUNITIES
-      );
-
-  if (
-    !strong.length
-  ) {
-    return `
-⏰ *گزارش ساعتی بازار*
-
-در حال حاضر فرصت معاملاتی قدرتمندی پیدا نشد.
-
-🔎 بازار همچنان تحت نظر است.
-`;
+  if (result.direction === "خرید") {
+    stop = entry - riskDistance;
+    tp1 = entry + riskDistance * 1.5;
+    tp2 = entry + riskDistance * 2.5;
+    tp3 = entry + riskDistance * 4;
+  } else {
+    stop = entry + riskDistance;
+    tp1 = entry - riskDistance * 1.5;
+    tp2 = entry - riskDistance * 2.5;
+    tp3 = entry - riskDistance * 4;
   }
 
-  let message = `
-🚨 *گزارش ساعتی بازار*
+  const volatility =
+    entry > 0
+      ? atrValue / entry
+      : 0.01;
 
-بهترین فرصت‌های فعلی:
+  let leverage = 3;
 
-`;
-
-  strong.forEach(
-    (r, index) => {
-      message += `
-${index + 1}. *${r.symbol}*
-
-${
-  r.signal ===
-  "فرصت خرید"
-    ? "🟢 فرصت خرید"
-    : "🔴 فرصت فروش"
-}
-
-⭐ امتیاز:
-${r.bestScore} از 100
-
-💰 قیمت:
-${formatPrice(
-  r.price
-)}
-
-🛑 حد ضرر:
-${formatPrice(
-  r.stop
-)}
-
-🎯 هدف اول:
-${formatPrice(
-  r.tp1
-)}
-
-🎯 هدف دوم:
-${formatPrice(
-  r.tp2
-)}
-
-⚙️ لوریج آزمایشی:
-${r.leverage}x
-
-━━━━━━━━━━━━━━
-`;
-    }
-  );
-
-  return (
-    message +
-    `
-🧪 معاملات فعلاً آزمایشی هستند.
-`
-  );
-}
-
-// --------------------------------------------------
-// Telegram
-// --------------------------------------------------
-
-async function sendTelegram(
-  token,
-  chatId,
-  text
-) {
-  if (
-    !token ||
-    !chatId
-  ) {
-    throw new Error(
-      "Telegram token یا chatId موجود نیست"
-    );
+  if (volatility < 0.005) {
+    leverage = 5;
+  } else if (volatility < 0.01) {
+    leverage = 4;
+  } else if (volatility > 0.025) {
+    leverage = 2;
   }
 
-  const response =
-    await fetchWithTimeout(
-      `https://api.telegram.org/bot${token}/sendMessage`,
-      {
-        method: "POST",
+  const riskAmount =
+    PAPER_BUDGET * (RISK_PERCENT / 100);
 
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
+  const stopPercent =
+    Math.abs(entry - stop) / entry;
 
-        body:
-          JSON.stringify({
-            chat_id:
-              chatId,
+  const positionNotional =
+    stopPercent > 0
+      ? riskAmount / stopPercent
+      : PAPER_BUDGET;
 
-            text,
+  const margin =
+    positionNotional / leverage;
 
-            parse_mode:
-              "Markdown",
-
-            disable_web_page_preview:
-              true
-          })
-      }
-    );
-
-  const data =
-    await response.json();
-
-  if (!data.ok) {
-    throw new Error(
-      data.description ||
-        "خطای تلگرام"
-    );
-  }
-
-  return data;
+  return {
+    symbol: result.symbol,
+    direction: result.direction,
+    entry,
+    stop,
+    tp1,
+    tp2,
+    tp3,
+    leverage,
+    riskAmount,
+    positionNotional,
+    margin,
+    createdAt: Date.now()
+  };
 }
 
-// --------------------------------------------------
-// پردازش /scan
-// --------------------------------------------------
+// ============================================================
+// KV - Paper Trades
+// ============================================================
 
-async function processScan(
-  env,
-  token,
-  chatId
-) {
+async function savePaperTrade(trade, env) {
+  if (!env.ALGO_ESMAIL_KV || !trade) return;
+
+  const id =
+    `trade:${trade.symbol}:${trade.createdAt}`;
+
   try {
-    log(
-      `پردازش اسکن برای ${chatId}`
+    await env.ALGO_ESMAIL_KV.put(
+      id,
+      JSON.stringify({
+        id,
+        ...trade,
+        status: "OPEN"
+      })
+    );
+  } catch (error) {
+    console.error(
+      "KV save trade error",
+      error
+    );
+  }
+}
+
+// ============================================================
+// گزارش
+// ============================================================
+
+function directionEmoji(direction) {
+  if (direction === "خرید") return "🟢";
+  if (direction === "فروش") return "🔴";
+  return "⚪";
+}
+
+function formatOpportunity(item, btcContext) {
+  const trade = calculateTrade(item);
+
+  if (!trade) return "";
+
+  const patterns =
+    item.analysis15?.patterns?.length
+      ? item.analysis15.patterns.join("، ")
+      : "الگوی خاصی دیده نشد";
+
+  const funding =
+    item.funding == null
+      ? "نامشخص"
+      : item.funding.toFixed(6);
+
+  const ls =
+    item.longShort == null
+      ? "نامشخص"
+      : item.longShort.toFixed(2);
+
+  return `
+${directionEmoji(item.direction)} *${item.symbol}*
+
+📊 امتیاز: *${item.score}/100*
+💰 قیمت: \`${formatNumber(item.price)}\`
+
+📈 روند 4ساعته: ${item.analysis4h.structure}
+📊 روند 1ساعته: ${item.analysis1h.structure}
+📉 روند 15دقیقه: ${item.analysis15.structure}
+
+RSI 1H: ${item.analysis1h.rsi.toFixed(1)}
+حجم: ${item.analysis1h.volumeRatio.toFixed(2)} برابر میانگین
+
+🕯 الگو:
+${patterns}
+
+🎯 ورود: \`${formatNumber(trade.entry)}\`
+🛑 حد ضرر: \`${formatNumber(trade.stop)}\`
+🥇 هدف 1: \`${formatNumber(trade.tp1)}\`
+🥈 هدف 2: \`${formatNumber(trade.tp2)}\`
+🥉 هدف 3: \`${formatNumber(trade.tp3)}\`
+
+⚙️ اهرم پیشنهادی: *${trade.leverage}x*
+
+💵 سرمایه آزمایشی: ${PAPER_BUDGET} USDT
+💸 ریسک: ${RISK_PERCENT}%
+
+💰 Funding: ${funding}
+👥 نسبت لانگ/شورت: ${ls}
+
+🧭 وضعیت BTC: ${btcContext.direction}
+`;
+}
+
+function buildScanReport(
+  results,
+  btcContext,
+  elapsedMs
+) {
+  const valid = results.filter(x => !x.failed);
+
+  const opportunities = valid
+    .filter(x =>
+      x.direction !== "خنثی" &&
+      x.score >= MIN_SIGNAL_SCORE
+    )
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+
+  const failed = results.filter(x => x.failed);
+
+  let text = `
+🤖 *ALGO ESMAIL V5*
+
+✅ اسکن بازار توبیت تمام شد.
+
+⏱ زمان اسکن: ${(elapsedMs / 1000).toFixed(1)} ثانیه
+
+🔎 ارزهای بررسی‌شده: ${results.length}
+✅ تحلیل موفق: ${valid.length}
+❌ ناموفق: ${failed.length}
+
+🧭 وضعیت کلی BTC: *${btcContext.direction}*
+
+━━━━━━━━━━━━━━━━━━
+`;
+
+  if (!opportunities.length) {
+    text += `
+⚪ *در حال حاضر فرصت قدرتمند پیدا نشد.*
+
+امتیاز حداقل سیگنال:
+${MIN_SIGNAL_SCORE}/100
+
+بازار فعلاً شرایط مناسبی برای ورود پرریسک نشان نمی‌دهد.
+`;
+
+    return text;
+  }
+
+  text += `
+🔥 *فرصت‌های برتر*
+`;
+
+  for (const item of opportunities) {
+    text += formatOpportunity(
+      item,
+      btcContext
+    );
+    text += "\n━━━━━━━━━━━━━━━━━━\n";
+  }
+
+  return text;
+}
+
+// ============================================================
+// اجرای اسکن
+// ============================================================
+
+async function performScan(env) {
+  const started = Date.now();
+
+  console.log("================================");
+  console.log("SCAN START");
+  console.log("================================");
+
+  try {
+    const symbols = await getBestSymbols();
+
+    console.log(
+      "Selected symbols:",
+      symbols.map(x => x.symbol)
     );
 
-    // بررسی معاملات قبلی
-    try {
-      await updatePaperTrades(
-        env
-      );
-    } catch (error) {
-      log(
-        "خطا در updatePaperTrades",
-        error.message
+    if (!symbols.length) {
+      throw new Error(
+        "هیچ ارز مناسبی از Toobit دریافت نشد."
       );
     }
 
-    // اسکن
-    const results =
-      await scanMarket();
+    // BTC و تحلیل ارزها همزمان شروع می‌شوند
+    const btcPromise = getBTCContext();
 
-    log(
-      `اسکن کامل شد. نتایج: ${results.length}`
+    const results = await runInBatches(
+      symbols,
+      ANALYSIS_BATCH,
+      analyzeSymbol
     );
 
-    // ثبت معاملات آزمایشی
-    for (
-      const result of results
-    ) {
-      try {
-        await savePaperTrade(
-          env,
-          result
-        );
-      } catch (error) {
-        log(
-          `خطای ذخیره ${result.symbol}`,
-          error.message
-        );
-      }
-    }
+    const btcContext = await btcPromise;
 
-    // ارسال گزارش
-    const report =
-      makeScanReport(
-        results
-      );
-
-    await sendTelegram(
-      token,
-      chatId,
-      report
+    console.log(
+      "Technical analysis completed:",
+      results.length
     );
 
-    log(
-      `گزارش اسکن برای ${chatId} ارسال شد`
+    const enriched =
+      await enrichDerivatives(results);
+
+    const elapsed =
+      Date.now() - started;
+
+    console.log(
+      "SCAN COMPLETE",
+      `${elapsed}ms`
     );
+
+    return {
+      results: enriched,
+      btcContext,
+      elapsed
+    };
 
   } catch (error) {
-    log(
-      "SCAN BACKGROUND ERROR",
-      error.stack ||
-        error.message
+    console.error(
+      "================================"
     );
 
-    try {
-      await sendTelegram(
-        token,
-        chatId,
-        `
-❌ *اسکن بازار با خطا متوقف شد.*
+    console.error(
+      "SCAN ERROR:",
+      error?.stack || error
+    );
 
-🔎 مرحله اسکن نتوانست کامل شود.
+    console.error(
+      "================================"
+    );
 
-🛠️ خطا:
-${String(
-  error.message ||
-    "خطای نامشخص"
-).slice(
-  0,
-  500
-)}
-
-لطفاً دوباره /scan را امتحان کنید.
-`
-      );
-    } catch (
-      telegramError
-    ) {
-      log(
-        "ارسال خطای اسکن به تلگرام ناموفق",
-        telegramError.message
-      );
-    }
+    throw error;
   }
 }
 
-// --------------------------------------------------
-// پردازش پیام
-// --------------------------------------------------
+// ============================================================
+// اشتراک
+// ============================================================
 
-async function handleUpdate(
-  update,
-  env,
-  ctx
-) {
-  if (
-    !update ||
-    !update.message
-  ) {
-    return;
+async function subscribe(chatId, env) {
+  if (!env.ALGO_ESMAIL_KV) {
+    throw new Error("KV متصل نیست.");
   }
 
-  const token =
-    env.BOT_TOKEN;
-
-  if (!token) {
-    throw new Error(
-      "BOT_TOKEN تنظیم نشده"
-    );
-  }
-
-  const chatId =
-    update.message.chat.id;
-
-  const text =
-    update.message.text ||
-    "";
-
-  // ------------------------------------------------
-  // START
-  // ------------------------------------------------
-
-  if (
-    text ===
-    "/start"
-  ) {
-    await sendTelegram(
-      token,
+  await env.ALGO_ESMAIL_KV.put(
+    `chat:${chatId}`,
+    JSON.stringify({
       chatId,
-      `
-🤖 *Algo Esmail V5*
+      createdAt: Date.now()
+    })
+  );
+}
 
-ربات با موفقیت فعال است. 🚀
+async function unsubscribe(chatId, env) {
+  if (!env.ALGO_ESMAIL_KV) {
+    throw new Error("KV متصل نیست.");
+  }
+
+  await env.ALGO_ESMAIL_KV.delete(
+    `chat:${chatId}`
+  );
+}
+
+async function getSubscribedChats(env) {
+  if (!env.ALGO_ESMAIL_KV) return [];
+
+  const list =
+    await env.ALGO_ESMAIL_KV.list({
+      prefix: "chat:",
+      limit: 100
+    });
+
+  return list.keys.map(x =>
+    x.name.replace("chat:", "")
+  );
+}
+
+// ============================================================
+// STATS
+// ============================================================
+
+async function getStats(env) {
+  if (!env.ALGO_ESMAIL_KV) {
+    return "❌ KV متصل نیست.";
+  }
+
+  const list =
+    await env.ALGO_ESMAIL_KV.list({
+      prefix: "trade:",
+      limit: 200
+    });
+
+  let total = 0;
+  let open = 0;
+  let wins = 0;
+  let losses = 0;
+  let pnl = 0;
+
+  for (const key of list.keys) {
+    try {
+      const raw =
+        await env.ALGO_ESMAIL_KV.get(key.name);
+
+      if (!raw) continue;
+
+      const trade = JSON.parse(raw);
+
+      total++;
+
+      if (trade.status === "OPEN") {
+        open++;
+      }
+
+      if (trade.status === "WIN") {
+        wins++;
+      }
+
+      if (trade.status === "LOSS") {
+        losses++;
+      }
+
+      pnl += safeNumber(trade.pnl);
+    } catch {}
+  }
+
+  const closed =
+    wins + losses;
+
+  const winRate =
+    closed > 0
+      ? (wins / closed) * 100
+      : 0;
+
+  return `
+📊 *آمار معاملات آزمایشی*
+
+کل معاملات: ${total}
+باز: ${open}
+برد: ${wins}
+باخت: ${losses}
+
+نرخ برد: *${winRate.toFixed(1)}%*
+
+سود/زیان:
+*${pnl.toFixed(2)} USDT*
+`;
+}
+
+// ============================================================
+// HELP
+// ============================================================
+
+function helpText() {
+  return `
+🤖 *ALGO ESMAIL V5*
+
+دستورات:
 
 /scan
-🔎 تحلیل بازار
+🔎 اسکن سریع بازار توبیت
 
 /signal BTC
-📊 تحلیل یک ارز
+📊 تحلیل بیت‌کوین
 
 /subscribe
-⏰ گزارش خودکار ساعتی
+🔔 دریافت گزارش خودکار
 
 /unsubscribe
-❌ لغو گزارش خودکار
+🔕 توقف گزارش خودکار
 
 /stats
-📊 عملکرد معاملات آزمایشی
+📊 آمار معاملات آزمایشی
+
+/health
+🩺 بررسی وضعیت ربات
 
 /help
 📚 راهنما
 
-🧪 معاملات واقعی غیرفعال هستند.
-`
-    );
+⚠️ معاملات فعلاً *آزمایشی* هستند.
+`;
+}
 
-    return;
+// ============================================================
+// SIGNAL
+// ============================================================
+
+async function singleSignal(symbolInput) {
+  let symbol = symbolInput.toUpperCase();
+
+  if (!symbol.includes("-")) {
+    symbol = `${symbol}-SWAP-USDT`;
   }
 
-  // ------------------------------------------------
-  // HELP
-  // ------------------------------------------------
+  const result = await analyzeSymbol({
+    symbol,
+    price: 0,
+    volume: 0,
+    change: 0
+  });
 
-  if (
-    text ===
-    "/help"
-  ) {
-    await sendTelegram(
-      token,
-      chatId,
-      `
-📚 *راهنمای Algo Esmail V5*
-
-/scan
-بررسی بازار و پیدا کردن فرصت‌ها
-
-/signal BTC
-تحلیل بیت‌کوین یا ارز دلخواه
-
-/subscribe
-گزارش خودکار ساعتی
-
-/unsubscribe
-لغو گزارش ساعتی
-
-/stats
-گزارش عملکرد Paper Trading
-
-🧪 معاملات واقعی غیرفعال هستند.
-`
+  if (result.failed) {
+    throw new Error(
+      result.error || "تحلیل انجام نشد."
     );
-
-    return;
   }
 
-  // ------------------------------------------------
-  // SUBSCRIBE
-  // ------------------------------------------------
+  const btc =
+    symbol === "BTC-SWAP-USDT"
+      ? result
+      : await getBTCContext();
 
-  if (
-    text ===
-    "/subscribe"
-  ) {
-    await saveChat(
-      env,
-      chatId
-    );
+  await enrichDerivatives([result]);
 
-    await sendTelegram(
-      token,
-      chatId,
-      `
-✅ *گزارش خودکار فعال شد.*
+  return formatOpportunity(
+    result,
+    btc
+  );
+}
 
-ربات هر ساعت بازار را بررسی می‌کند.
+// ============================================================
+// HEALTH
+// ============================================================
 
-🧪 معاملات فعلاً آزمایشی هستند.
-`
-    );
+async function healthText(env) {
+  let kvStatus = "❌";
 
-    return;
-  }
-
-  // ------------------------------------------------
-  // UNSUBSCRIBE
-  // ------------------------------------------------
-
-  if (
-    text ===
-    "/unsubscribe"
-  ) {
-    await removeChat(
-      env,
-      chatId
-    );
-
-    await sendTelegram(
-      token,
-      chatId,
-      `
-✅ گزارش خودکار غیرفعال شد.
-`
-    );
-
-    return;
-  }
-
-  // ------------------------------------------------
-  // STATS
-  // ------------------------------------------------
-
-  if (
-    text ===
-    "/stats"
-  ) {
+  if (env.ALGO_ESMAIL_KV) {
     try {
-      await updatePaperTrades(
+      await env.ALGO_ESMAIL_KV.put(
+        "health:last",
+        String(Date.now()),
+        {
+          expirationTtl: 300
+        }
+      );
+
+      kvStatus = "✅";
+    } catch {
+      kvStatus = "❌";
+    }
+  }
+
+  const botStatus =
+    env.BOT_TOKEN
+      ? "✅"
+      : "❌";
+
+  let toobitStatus = "❌";
+
+  try {
+    const response =
+      await fetch(
+        `${BASE_URL}/api/v1/exchangeInfo`,
+        {
+          method: "GET"
+        }
+      );
+
+    if (response.ok) {
+      toobitStatus = "✅";
+    }
+  } catch {}
+
+  return `
+🩺 *وضعیت ALGO ESMAIL*
+
+🤖 Telegram Bot Token: ${botStatus}
+💾 Cloudflare KV: ${kvStatus}
+📡 Toobit API: ${toobitStatus}
+
+⚙️ نسخه: V5
+🔎 تعداد اسکن: ${MAX_ANALYSIS_SYMBOLS} ارز
+📊 حداقل امتیاز: ${MIN_SIGNAL_SCORE}
+💰 معاملات واقعی: ❌ خاموش
+`;
+}
+
+// ============================================================
+// پردازش پیام تلگرام
+// ============================================================
+
+async function processUpdate(update, env, ctx) {
+  try {
+    if (!update?.message) return;
+
+    const message = update.message;
+    const chatId = message.chat?.id;
+
+    if (!chatId) return;
+
+    const text =
+      String(message.text || "").trim();
+
+    if (!text) return;
+
+    const command =
+      text.split(/\s+/)[0].toLowerCase();
+
+    // ------------------------------------------
+    // HELP
+    // ------------------------------------------
+
+    if (
+      command === "/start" ||
+      command === "/help"
+    ) {
+      await sendMessage(
+        chatId,
+        helpText(),
+        env,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    // ------------------------------------------
+    // HEALTH
+    // ------------------------------------------
+
+    if (command === "/health") {
+      const text =
+        await healthText(env);
+
+      await sendMessage(
+        chatId,
+        text,
+        env,
+        { parse_mode: "Markdown" }
+      );
+
+      return;
+    }
+
+    // ------------------------------------------
+    // SUBSCRIBE
+    // ------------------------------------------
+
+    if (command === "/subscribe") {
+      await subscribe(chatId, env);
+
+      await sendMessage(
+        chatId,
+        "🔔 اشتراک گزارش‌های خودکار فعال شد.",
         env
       );
 
-      const report =
-        await makeStatsReport(
-          env
+      return;
+    }
+
+    // ------------------------------------------
+    // UNSUBSCRIBE
+    // ------------------------------------------
+
+    if (command === "/unsubscribe") {
+      await unsubscribe(chatId, env);
+
+      await sendMessage(
+        chatId,
+        "🔕 اشتراک گزارش‌های خودکار غیرفعال شد.",
+        env
+      );
+
+      return;
+    }
+
+    // ------------------------------------------
+    // STATS
+    // ------------------------------------------
+
+    if (command === "/stats") {
+      const text =
+        await getStats(env);
+
+      await sendMessage(
+        chatId,
+        text,
+        env,
+        { parse_mode: "Markdown" }
+      );
+
+      return;
+    }
+
+    // ------------------------------------------
+    // SIGNAL
+    // ------------------------------------------
+
+    if (command === "/signal") {
+      const parts =
+        text.split(/\s+/);
+
+      const input =
+        parts[1] || "BTC";
+
+      await sendMessage(
+        chatId,
+        `📊 در حال تحلیل ${input.toUpperCase()}...`,
+        env
+      );
+
+      try {
+        const result =
+          await singleSignal(input);
+
+        await sendMessage(
+          chatId,
+          result || "سیگنال مناسبی پیدا نشد.",
+          env,
+          { parse_mode: "Markdown" }
         );
 
-      await sendTelegram(
-        token,
-        chatId,
-        report
-      );
+      } catch (error) {
+        console.error(
+          "SIGNAL ERROR:",
+          error?.stack || error
+        );
 
-    } catch (error) {
-      log(
-        "STATS ERROR",
-        error.message
-      );
+        await sendMessage(
+          chatId,
+          `❌ تحلیل انجام نشد.\n\nخطا:\n${error.message}`,
+          env
+        );
+      }
 
-      await sendTelegram(
-        token,
-        chatId,
-        `
-❌ دریافت آمار با خطا مواجه شد.
-
-🛠️ خطا:
-${String(
-  error.message ||
-    "خطای نامشخص"
-).slice(
-  0,
-  400
-)}
-`
-      );
+      return;
     }
 
-    return;
-  }
+    // ------------------------------------------
+    // SCAN
+    // ------------------------------------------
 
-  // ------------------------------------------------
-  // SCAN
-  // ------------------------------------------------
+    if (command === "/scan") {
 
-  if (
-    text ===
-    "/scan"
-  ) {
-    // پیام فقط یک بار ارسال می‌شود
-    await sendTelegram(
-      token,
-      chatId,
-      `
-🔎 *در حال بررسی بازار توبیت...*
-
-⏳ لطفاً چند لحظه صبر کنید.
-
-نتیجه پس از پایان اسکن ارسال می‌شود.
-`
-    );
-
-    // اجرای اسکن در پس‌زمینه
-    ctx.waitUntil(
-      processScan(
+      // بسیار مهم:
+      // پیام اولیه بلافاصله ارسال می‌شود
+      await sendMessage(
+        chatId,
+        "🔎 *در حال بررسی بازار توبیت...*\n\n⏳ لطفاً چند لحظه صبر کنید.\n\nنتیجه پس از پایان اسکن ارسال می‌شود.",
         env,
-        token,
-        chatId
-      )
-    );
+        { parse_mode: "Markdown" }
+      );
 
-    return;
-  }
+      // عملیات سنگین را به پس‌زمینه می‌فرستیم
+      ctx.waitUntil(
+        (async () => {
+          try {
+            console.log(
+              "BACKGROUND SCAN START",
+              chatId
+            );
 
-  // ------------------------------------------------
-  // SIGNAL
-  // ------------------------------------------------
+            const scan =
+              await performScan(env);
 
-  if (
-    text.startsWith(
-      "/signal"
-    )
-  ) {
-    let symbol =
-      text
-        .replace(
-          "/signal",
-          ""
-        )
-        .trim()
-        .toUpperCase();
+            const report =
+              buildScanReport(
+                scan.results,
+                scan.btcContext,
+                scan.elapsed
+              );
 
-    if (!symbol) {
-      symbol =
-        "BTC";
+            await sendMessage(
+              chatId,
+              report,
+              env,
+              { parse_mode: "Markdown" }
+            );
+
+            console.log(
+              "BACKGROUND SCAN REPORT SENT",
+              chatId
+            );
+
+          } catch (error) {
+
+            console.error(
+              "BACKGROUND SCAN FAILED:",
+              error?.stack || error
+            );
+
+            // این قسمت مهم است:
+            // حتی اگر اسکن شکست بخورد،
+            // کاربر پیام خطا می‌گیرد.
+            try {
+              await sendMessage(
+                chatId,
+                `❌ *اسکن بازار متوقف شد.*\n\nدلیل:\n\`${String(error?.message || error).slice(0, 700)}\`\n\nلطفاً دستور /health را هم بزن تا وضعیت Worker را بررسی کنیم.`,
+                env,
+                { parse_mode: "Markdown" }
+              );
+            } catch (telegramError) {
+              console.error(
+                "ERROR MESSAGE SEND FAILED:",
+                telegramError?.stack || telegramError
+              );
+            }
+          }
+        })()
+      );
+
+      return;
     }
 
-    if (
-      !symbol.includes(
-        "-SWAP-USDT"
-      )
-    ) {
-      symbol =
-        `${symbol}-SWAP-USDT`;
-    }
-
-    await sendTelegram(
-      token,
-      chatId,
-      `🔎 در حال تحلیل ${symbol}...`
+  } catch (error) {
+    console.error(
+      "PROCESS UPDATE ERROR:",
+      error?.stack || error
     );
 
     try {
-      const btcContext =
-        await getBTCContext();
-
-      const result =
-        await analyzeSymbol(
-          symbol,
-          btcContext
+      if (update?.message?.chat?.id) {
+        await sendMessage(
+          update.message.chat.id,
+          `❌ خطایی در پردازش درخواست رخ داد.\n\n${String(error.message || error).slice(0, 700)}`,
+          env
         );
-
-      await savePaperTrade(
-        env,
-        result
-      );
-
-      await sendTelegram(
-        token,
-        chatId,
-        makeScanReport(
-          [result]
-        )
-      );
-
-    } catch (error) {
-      log(
-        `SIGNAL ERROR ${symbol}`,
-        error.message
-      );
-
-      await sendTelegram(
-        token,
-        chatId,
-        `
-❌ تحلیل ${symbol} انجام نشد.
-
-🛠️ خطا:
-${String(
-  error.message ||
-    "خطای نامشخص"
-).slice(
-  0,
-  400
-)}
-`
+      }
+    } catch (sendError) {
+      console.error(
+        "FINAL ERROR SEND FAILED:",
+        sendError?.stack || sendError
       );
     }
-
-    return;
   }
 }
 
-// --------------------------------------------------
-// Worker
-// --------------------------------------------------
+// ============================================================
+// Scheduled
+// ============================================================
+
+async function scheduledHandler(env) {
+  console.log("SCHEDULED SCAN START");
+
+  try {
+    const chats =
+      await getSubscribedChats(env);
+
+    if (!chats.length) {
+      console.log(
+        "No subscribed chats."
+      );
+      return;
+    }
+
+    const scan =
+      await performScan(env);
+
+    const report =
+      buildScanReport(
+        scan.results,
+        scan.btcContext,
+        scan.elapsed
+      );
+
+    for (const chatId of chats) {
+      try {
+        await sendMessage(
+          chatId,
+          report,
+          env,
+          { parse_mode: "Markdown" }
+        );
+      } catch (error) {
+        console.error(
+          "Scheduled Telegram error:",
+          chatId,
+          error?.stack || error
+        );
+      }
+
+      // جلوگیری از فشار به Telegram
+      await sleep(100);
+    }
+
+    console.log(
+      "SCHEDULED SCAN COMPLETE"
+    );
+
+  } catch (error) {
+    console.error(
+      "SCHEDULED SCAN ERROR:",
+      error?.stack || error
+    );
+  }
+}
+
+// ============================================================
+// CLOUDFLARE WORKER
+// ============================================================
 
 export default {
 
-  async fetch(
-    request,
-    env,
-    ctx
-  ) {
+  async fetch(request, env, ctx) {
 
+    const url =
+      new URL(request.url);
+
+    // ------------------------------------------
     // GET
-    if (
-      request.method ===
-      "GET"
-    ) {
-      return new Response(
-        "Algo Esmail V5 is running!"
-      );
-    }
+    // ------------------------------------------
 
-    // فقط POST
-    if (
-      request.method !==
-      "POST"
-    ) {
+    if (request.method === "GET") {
+
       return new Response(
-        "Method Not Allowed",
+        "ALGO ESMAIL V5 is LIVE 🤖",
         {
-          status: 405
+          status: 200,
+          headers: {
+            "content-type":
+              "text/plain; charset=utf-8"
+          }
         }
       );
     }
 
-    try {
+    // ------------------------------------------
+    // POST Telegram Webhook
+    // ------------------------------------------
 
-      const update =
-        await request.json();
+    if (request.method === "POST") {
 
-      // پردازش پیام در پس‌زمینه
-      ctx.waitUntil(
-        handleUpdate(
-          update,
-          env,
-          ctx
-        ).catch(error => {
+      try {
 
-          console.error(
-            "[ALGO ESMAIL] UPDATE ERROR:",
-            error.stack ||
-              error.message
-          );
+        const update =
+          await request.json();
 
-        })
-      );
+        // بسیار مهم:
+        // دیگر منتظر پردازش نمی‌مانیم.
+        ctx.waitUntil(
+          processUpdate(
+            update,
+            env,
+            ctx
+          )
+        );
 
-      // پاسخ فوری به Telegram
-      return new Response(
-        "OK",
-        {
-          status: 200
-        }
-      );
+        // Telegram بلافاصله 200 می‌گیرد
+        return new Response(
+          "OK",
+          {
+            status: 200
+          }
+        );
 
-    } catch (error) {
+      } catch (error) {
 
-      console.error(
-        "[ALGO ESMAIL] WORKER ERROR:",
-        error.stack ||
-          error.message
-      );
+        console.error(
+          "WEBHOOK ERROR:",
+          error?.stack || error
+        );
 
-      return new Response(
-        "Internal Server Error",
-        {
-          status: 500
-        }
-      );
+        return new Response(
+          "Bad Request",
+          {
+            status: 400
+          }
+        );
+      }
     }
+
+    return new Response(
+      "Method Not Allowed",
+      {
+        status: 405
+      }
+    );
   },
 
-  // ------------------------------------------------
-  // اجرای خودکار ساعتی
-  // ------------------------------------------------
+  async scheduled(event, env, ctx) {
 
-  async scheduled(
-    event,
-    env,
-    ctx
-  ) {
-
-    log(
-      "========== شروع اجرای ساعتی =========="
+    ctx.waitUntil(
+      scheduledHandler(env)
     );
-
-    try {
-
-      // بررسی معاملات قبلی
-      try {
-        await updatePaperTrades(
-          env
-        );
-      } catch (error) {
-        log(
-          "خطا در بررسی معاملات قبلی",
-          error.message
-        );
-      }
-
-      const chats =
-        await getSubscribedChats(
-          env
-        );
-
-      if (
-        !chats.length
-      ) {
-        log(
-          "کاربر مشترکی وجود ندارد"
-        );
-
-        return;
-      }
-
-      // اسکن
-      const results =
-        await scanMarket();
-
-      // ذخیره Paper Trade
-      for (
-        const result of results
-      ) {
-        try {
-          await savePaperTrade(
-            env,
-            result
-          );
-        } catch (error) {
-          log(
-            `خطای ذخیره ${result.symbol}`,
-            error.message
-          );
-        }
-      }
-
-      // گزارش
-      const report =
-        makeHourlyReport(
-          results
-        );
-
-      // ارسال به کاربران
-      for (
-        const chatId of chats
-      ) {
-        try {
-
-          await sendTelegram(
-            env.BOT_TOKEN,
-            chatId,
-            report
-          );
-
-        } catch (error) {
-
-          log(
-            `خطا در ارسال گزارش به ${chatId}`,
-            error.message
-          );
-
-        }
-      }
-
-      log(
-        "========== اجرای ساعتی تمام شد =========="
-      );
-
-    } catch (error) {
-
-      log(
-        "SCHEDULE ERROR",
-        error.stack ||
-          error.message
-      );
-    }
   }
 };
