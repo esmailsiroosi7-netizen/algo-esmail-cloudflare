@@ -1,5 +1,5 @@
 // ============================================================
-// ALGO FJM V6.0 - OPTIMIZED
+// ALGO FJM V6.0 - OPTIMIZED & FIXED
 // Cloudflare Workers + Telegram + Dashboard API
 // ============================================================
 
@@ -18,7 +18,7 @@ const DEFAULT_HISTORY_LIMIT = 10;
 const MAX_HISTORY_LIMIT = 50;
 
 // ============================================================
-// UTILITY FUNCTIONS
+// UTILITY
 // ============================================================
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function safeNumber(v, f = 0) { const n = Number(v); return Number.isFinite(n) ? n : f; }
@@ -216,11 +216,9 @@ function analyzeTimeframe(candles) {
   if (structure === "صعودی") bull += 12;
   if (structure === "نزولی") bear += 12;
   if (volumeRatio >= 1.3) { if (price > e20) bull += 6; else bear += 6; }
-  const resDist = sr.resistance > 0 ? ((sr.resistance-price)/price)*100 : 999;
-  const supDist = sr.support > 0 ? ((price-sr.support)/price)*100 : 999;
   const patterns = candlePatterns(candles);
   for (const p of patterns) { if (p.includes("صعودی") || p==="چکش") bull += 5; if (p.includes("نزولی") || p==="شهاب‌سنگ") bear += 5; }
-  return { price, ema20:e20, ema50:e50, ema200:e200, rsi:rsiValue, atr:atrValue, macd:macdLine, macdSignal, macdHistogram:macdHist, volumeRatio, structure, support:sr.support, resistance:sr.resistance, resistanceDistance:resDist, supportDistance:supDist, patterns, bull, bear };
+  return { price, ema20:e20, ema50:e50, ema200:e200, rsi:rsiValue, atr:atrValue, macd:macdLine, macdSignal, macdHistogram:macdHist, volumeRatio, structure, support:sr.support, resistance:sr.resistance, patterns, bull, bear };
 }
 
 function combineAnalysis(a15, a1h, a4h) {
@@ -288,22 +286,22 @@ async function runInBatches(items, batchSize, worker) {
 }
 
 // ============================================================
-// PAPER TRADE - IMPROVED
+// PAPER TRADE - IMPROVED (با فیلترهای جدید)
 // ============================================================
 function calculateTrade(result, btcContext) {
   if (!result || result.failed || result.direction === "خنثی") return null;
   
-  // BTC Context Filter
+  // 1. فیلتر BTC Context (نصف شدن امتیاز)
   if (btcContext && btcContext.direction !== "خنثی" && btcContext.direction !== result.direction) {
-    result.score *= 0.5; // نصف امتیاز
+    result.score *= 0.5;
   }
   
-  // Volume Filter
+  // 2. فیلتر حجم (حداقل 1.2 برابر میانگین)
   if (result.analysis1h?.volumeRatio < 1.2) {
-    return null; // رد کن
+    return null;
   }
   
-  // Direction Filter: موقتاً فقط فروش
+  // 3. غیرفعال کردن خرید (موقت)
   if (result.direction === "خرید") {
     return null;
   }
@@ -311,18 +309,19 @@ function calculateTrade(result, btcContext) {
   const entry = result.price;
   const atrValue = result.analysis1h?.atr || entry * 0.01;
   
-  // NEW: حد ضرر 2.5x ATR
+  // 4. حد ضرر 2.5x ATR
   const riskDistance = Math.max(atrValue * 2.5, entry * 0.005);
   
   let stop, tp1, tp2, tp3;
   if (result.direction === "خرید") {
+    // این بخش فعلاً اجرا نمیشه چون خرید غیرفعاله
     stop = entry - riskDistance;
     tp1 = entry + riskDistance * 2.5;
     tp2 = entry + riskDistance * 4.0;
     tp3 = entry + riskDistance * 6.0;
-  } else {
+  } else { // فروش
     stop = entry + riskDistance;
-    tp1 = entry - riskDistance * 2.5;
+    tp1 = entry - riskDistance * 2.5;   // نسبت 1:2.5
     tp2 = entry - riskDistance * 4.0;
     tp3 = entry - riskDistance * 6.0;
   }
@@ -333,7 +332,7 @@ function calculateTrade(result, btcContext) {
   else if (volatility < 0.01) leverage = 4;
   else if (volatility > 0.025) leverage = 2;
   
-  // Dynamic position size based on score
+  // حجم پویا بر اساس امتیاز
   let positionMultiplier = 1;
   if (result.score >= 90) positionMultiplier = 2.5;
   else if (result.score >= 80) positionMultiplier = 2.0;
@@ -429,11 +428,8 @@ async function savePaperTrade(trade, env) {
 
 async function recordPaperTrades(results, btcContext, env) {
   if (!env.ALGO_ESMAIL_KV) return { saved:0, skipped:0 };
-  
-  // Check concurrent trades limit
   const openCount = await getOpenTradesCount(env);
   if (openCount >= MAX_CONCURRENT_TRADES) return { saved:0, skipped:0 };
-  
   const opportunities = results.filter(x => !x.failed && x.direction !== "خنثی" && x.score >= MIN_SIGNAL_SCORE).sort((a,b)=>b.score-a.score).slice(0, 5);
   let saved=0, skipped=0;
   for (const item of opportunities) {
@@ -451,7 +447,7 @@ async function recordPaperTrades(results, btcContext, env) {
 }
 
 // ============================================================
-// UPDATE OPEN PAPER TRADES (WITH PYRAMID EXIT)
+// UPDATE OPEN PAPER TRADES (با خروج پله‌ای)
 // ============================================================
 async function updateOpenPaperTrades(env) {
   if (!env.ALGO_ESMAIL_KV) return { checked:0, closed:0, expired:0, ambiguous:0, closedTrades:[] };
@@ -496,81 +492,71 @@ async function updateOpenPaperTrades(env) {
         let partials = { tp1Hit: false, tp2Hit: false, tp3Hit: false };
         let exitPrice = entry;
         let pnlPercent = 0;
-        let positionSize = safeNumber(trade.positionNotional);
+        const positionSize = safeNumber(trade.positionNotional);
         let remainingSize = positionSize;
         for (const candle of relevant) {
           const high = safeNumber(candle.high), low = safeNumber(candle.low);
-          // Check stop loss
-          if (trade.direction === "خرید") {
-            if (low <= stop) {
-              result = { status:"LOSS", firstTarget:"SL", exitPrice: stop, candleTime: safeNumber(candle.time) };
-              break;
-            }
-            if (high >= tp1 && !partials.tp1Hit) {
-              partials.tp1Hit = true;
-              const exitAmount = positionSize * 0.5;
-              remainingSize -= exitAmount;
-              const pnl = ((tp1 - entry) / entry) * 100;
-              pnlPercent += pnl * (exitAmount / positionSize);
-              exitPrice = tp1;
-            }
-            if (high >= tp2 && !partials.tp2Hit && partials.tp1Hit) {
-              partials.tp2Hit = true;
-              const exitAmount = remainingSize * 0.6;
-              remainingSize -= exitAmount;
-              const pnl = ((tp2 - entry) / entry) * 100;
-              pnlPercent += pnl * (exitAmount / positionSize);
-              exitPrice = tp2;
-            }
-            if (high >= tp3 && !partials.tp3Hit && partials.tp2Hit) {
-              partials.tp3Hit = true;
-              const exitAmount = remainingSize;
-              remainingSize -= exitAmount;
-              const pnl = ((tp3 - entry) / entry) * 100;
-              pnlPercent += pnl * (exitAmount / positionSize);
-              exitPrice = tp3;
-              result = { status:"WIN", firstTarget:"TP3", exitPrice: tp3, candleTime: safeNumber(candle.time) };
-              break;
-            }
-          } else { // فروش
+          if (trade.direction === "فروش") {
             if (high >= stop) {
-              result = { status:"LOSS", firstTarget:"SL", exitPrice: stop, candleTime: safeNumber(candle.time) };
+              result = { status:"LOSS", firstTarget:"SL", exitPrice: stop };
               break;
             }
             if (low <= tp1 && !partials.tp1Hit) {
               partials.tp1Hit = true;
-              const exitAmount = positionSize * 0.5;
+              const exitAmount = remainingSize * 0.5;
               remainingSize -= exitAmount;
-              const pnl = ((entry - tp1) / entry) * 100;
-              pnlPercent += pnl * (exitAmount / positionSize);
+              pnlPercent += ((entry - tp1) / entry) * 100 * (exitAmount / positionSize);
               exitPrice = tp1;
             }
             if (low <= tp2 && !partials.tp2Hit && partials.tp1Hit) {
               partials.tp2Hit = true;
               const exitAmount = remainingSize * 0.6;
               remainingSize -= exitAmount;
-              const pnl = ((entry - tp2) / entry) * 100;
-              pnlPercent += pnl * (exitAmount / positionSize);
+              pnlPercent += ((entry - tp2) / entry) * 100 * (exitAmount / positionSize);
               exitPrice = tp2;
             }
             if (low <= tp3 && !partials.tp3Hit && partials.tp2Hit) {
               partials.tp3Hit = true;
               const exitAmount = remainingSize;
               remainingSize -= exitAmount;
-              const pnl = ((entry - tp3) / entry) * 100;
-              pnlPercent += pnl * (exitAmount / positionSize);
+              pnlPercent += ((entry - tp3) / entry) * 100 * (exitAmount / positionSize);
               exitPrice = tp3;
-              result = { status:"WIN", firstTarget:"TP3", exitPrice: tp3, candleTime: safeNumber(candle.time) };
+              result = { status:"WIN", firstTarget:"TP3", exitPrice: tp3 };
+              break;
+            }
+          } else { // خرید (فعلاً غیرفعاله ولی برای آینده)
+            if (low <= stop) {
+              result = { status:"LOSS", firstTarget:"SL", exitPrice: stop };
+              break;
+            }
+            if (high >= tp1 && !partials.tp1Hit) {
+              partials.tp1Hit = true;
+              const exitAmount = remainingSize * 0.5;
+              remainingSize -= exitAmount;
+              pnlPercent += ((tp1 - entry) / entry) * 100 * (exitAmount / positionSize);
+              exitPrice = tp1;
+            }
+            if (high >= tp2 && !partials.tp2Hit && partials.tp1Hit) {
+              partials.tp2Hit = true;
+              const exitAmount = remainingSize * 0.6;
+              remainingSize -= exitAmount;
+              pnlPercent += ((tp2 - entry) / entry) * 100 * (exitAmount / positionSize);
+              exitPrice = tp2;
+            }
+            if (high >= tp3 && !partials.tp3Hit && partials.tp2Hit) {
+              partials.tp3Hit = true;
+              const exitAmount = remainingSize;
+              remainingSize -= exitAmount;
+              pnlPercent += ((tp3 - entry) / entry) * 100 * (exitAmount / positionSize);
+              exitPrice = tp3;
+              result = { status:"WIN", firstTarget:"TP3", exitPrice: tp3 };
               break;
             }
           }
         }
-        if (!result) {
-          // اگر هیچ TP یا SL نخورد، همچنان باز بمونه
-          return;
-        }
-        const pnlUsdt = (pnlPercent / 100) * safeNumber(trade.positionNotional);
-        const updated = { ...trade, status: result.status, result: result.status, firstTarget: result.firstTarget, exitPrice: result.exitPrice, pnlUsdt: Number(pnlUsdt.toFixed(4)), pnl: Number(pnlUsdt.toFixed(4)), pnlPercent: Number(pnlPercent.toFixed(4)), closedAt: now, candleTime: result.candleTime, updatedAt: now };
+        if (!result) return;
+        const pnlUsdt = (pnlPercent / 100) * positionSize;
+        const updated = { ...trade, status: result.status, result: result.status, firstTarget: result.firstTarget, exitPrice: result.exitPrice, pnlUsdt: Number(pnlUsdt.toFixed(4)), pnl: Number(pnlUsdt.toFixed(4)), pnlPercent: Number(pnlPercent.toFixed(4)), closedAt: now, updatedAt: now };
         await env.ALGO_ESMAIL_KV.put(trade.id, JSON.stringify(updated));
         closed++;
         if (result.status === "AMBIGUOUS") ambiguous++;
@@ -740,17 +726,13 @@ async function handleDashboardAPI(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   
-  // CORS headers
   const headers = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
   };
-  if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers });
-  }
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
   
-  // GET /api/status
   if (path === "/api/status" && request.method === "GET") {
     try {
       const keys = await listAllKeys(env, "trade:");
@@ -781,7 +763,6 @@ async function handleDashboardAPI(request, env) {
     }
   }
   
-  // GET /api/trades
   if (path === "/api/trades" && request.method === "GET") {
     try {
       const urlParams = new URLSearchParams(url.search);
@@ -806,10 +787,8 @@ async function handleDashboardAPI(request, env) {
     }
   }
   
-  // POST /api/kill
   if (path === "/api/kill" && request.method === "POST") {
     try {
-      // Close all open trades manually (set as EXPIRED)
       const keys = await listAllKeys(env, "trade:");
       let killed = 0;
       for (const key of keys) {
@@ -830,11 +809,9 @@ async function handleDashboardAPI(request, env) {
     }
   }
   
-  // POST /api/settings (simple)
   if (path === "/api/settings" && request.method === "POST") {
     try {
       const body = await request.json();
-      // Only store in KV for now
       if (env.ALGO_ESMAIL_KV) {
         await env.ALGO_ESMAIL_KV.put("settings:current", JSON.stringify(body));
       }
@@ -848,95 +825,7 @@ async function handleDashboardAPI(request, env) {
 }
 
 // ============================================================
-// PROCESS TELEGRAM UPDATE
-// ============================================================
-async function processUpdate(update, env, ctx) {
-  try {
-    if (!update?.message) return;
-    const message = update.message;
-    const chatId = message.chat?.id;
-    if (!chatId) return;
-    const text = String(message.text || "").trim();
-    if (!text) return;
-    const command = text.split(/\s+/)[0].toLowerCase();
-    
-    if (command === "/start" || command === "/help") {
-      await sendMessage(chatId, helpText(), env, { parse_mode:"Markdown" });
-    }
-    else if (command === "/health") {
-      await sendMessage(chatId, await healthText(env), env, { parse_mode:"Markdown" });
-    }
-    else if (command === "/subscribe") {
-      await subscribe(chatId, env);
-      await sendMessage(chatId, "🔔 اشتراک فعال شد.", env);
-    }
-    else if (command === "/unsubscribe") {
-      await unsubscribe(chatId, env);
-      await sendMessage(chatId, "🔕 اشتراک لغو شد.", env);
-    }
-    else if (command === "/resetstats") {
-      await sendMessage(chatId, "🧹 در حال پاک کردن آمار...", env);
-      const result = await resetStats(env);
-      await sendMessage(chatId, `✅ ${result.deleted} معامله حذف شد.`, env);
-    }
-    else if (command === "/stats") {
-      const result = await getStats(env);
-      await sendMessage(chatId, result, env, { parse_mode:"Markdown" });
-    }
-    else if (command === "/paper") {
-      // Simplified: just show open trades count
-      const openCount = await getOpenTradesCount(env);
-      await sendMessage(chatId, `📝 معاملات باز: ${openCount}`, env);
-    }
-    else if (command === "/history") {
-      const parts = text.split(/\s+/);
-      const limit = parts[1] ? safeNumber(parts[1], DEFAULT_HISTORY_LIMIT) : DEFAULT_HISTORY_LIMIT;
-      await sendMessage(chatId, "📚 برای تاریخچه دقیق، لطفاً از داشبورد استفاده کنید.", env);
-    }
-    else if (command === "/diagnostics") {
-      await sendMessage(chatId, "🔬 تحلیل تشخیصی: لطفاً از داشبورد استفاده کنید.", env);
-    }
-    else if (command === "/scan") {
-      await sendMessage(chatId, "🔎 در حال اسکن بازار...", env);
-      ctx.waitUntil((async () => {
-        try {
-          const tradeUpdate = await updateOpenPaperTrades(env);
-          if (tradeUpdate.closedTrades?.length) await notifyClosedTrades(tradeUpdate.closedTrades, env);
-          const scan = await performScan(env);
-          const paperInfo = await recordPaperTrades(scan.results, scan.btcContext, env);
-          const report = buildScanReport(scan.results, scan.btcContext, scan.elapsed, paperInfo, tradeUpdate);
-          await sendMessage(chatId, report, env, { parse_mode:"Markdown" });
-        } catch (error) {
-          await sendMessage(chatId, `❌ اسکن ناموفق: ${error.message}`, env);
-        }
-      })());
-    }
-  } catch (error) {
-    console.error("Process error:", error);
-  }
-}
-
-// ============================================================
-// SCHEDULED
-// ============================================================
-async function scheduledHandler(env) {
-  try {
-    const tradeUpdate = await updateOpenPaperTrades(env);
-    if (tradeUpdate.closedTrades?.length) await notifyClosedTrades(tradeUpdate.closedTrades, env);
-    const chats = await getSubscribedChats(env);
-    if (!chats.length) return;
-    const scan = await performScan(env);
-    const paperInfo = await recordPaperTrades(scan.results, scan.btcContext, env);
-    const report = buildScanReport(scan.results, scan.btcContext, scan.elapsed, paperInfo, tradeUpdate);
-    for (const chatId of chats) {
-      try { await sendMessage(chatId, report, env, { parse_mode:"Markdown" }); } catch {}
-      await sleep(100);
-    }
-  } catch (error) { console.error("Scheduled error:", error); }
-}
-
-// ============================================================
-// DASHBOARD HTML (served from Worker)
+// DASHBOARD HTML
 // ============================================================
 function getDashboardHTML() {
   return `<!DOCTYPE html>
@@ -990,7 +879,6 @@ function getDashboardHTML() {
 <body>
 <div class="container">
   <h1>⚡ ALGO FJM V6.0 <span class="badge">DASHBOARD</span></h1>
-  
   <div class="grid" id="statsGrid">
     <div class="card blue"><div class="label">موجودی</div><div class="value" id="budget">100</div><div class="sub">USDT</div></div>
     <div class="card purple"><div class="label">معاملات کل</div><div class="value" id="total">0</div><div class="sub">بسته + باز</div></div>
@@ -999,12 +887,10 @@ function getDashboardHTML() {
     <div class="card red"><div class="label">باخت</div><div class="value" id="losses">0</div><div class="sub">ضرر کل</div></div>
     <div class="card gold"><div class="label">سود/زیان</div><div class="value" id="pnl">0</div><div class="sub">USDT</div></div>
   </div>
-  
   <div class="flex mb-4">
     <button class="btn btn-primary" onclick="refreshData()">🔄 بروزرسانی</button>
     <button class="btn btn-danger" onclick="killSwitch()">🚨 KILL SWITCH</button>
   </div>
-  
   <div class="section-title">📊 معاملات اخیر</div>
   <div style="overflow-x:auto;">
     <table>
@@ -1014,7 +900,6 @@ function getDashboardHTML() {
       </tbody>
     </table>
   </div>
-  
   <div class="section-title">⚙️ تنظیمات سریع</div>
   <div class="settings-row">
     <label>حداکثر معامله همزمان:</label>
@@ -1026,20 +911,16 @@ function getDashboardHTML() {
     <input type="number" id="minScore" value="65" min="50" max="90">
     <button class="btn btn-outline" onclick="saveSetting('minScore')">ذخیره</button>
   </div>
-  
   <div class="mt-4" style="color:#555;font-size:12px;">
     ⚠️ همه معاملات Paper Trade هستند. هیچ معامله واقعی انجام نمی‌شود.
   </div>
 </div>
-
 <script>
 const API_BASE = window.location.origin;
-
 async function fetchAPI(path, opts = {}) {
   const res = await fetch(API_BASE + path, opts);
   return res.json();
 }
-
 async function refreshData() {
   try {
     const status = await fetchAPI('/api/status');
@@ -1050,7 +931,6 @@ async function refreshData() {
     document.getElementById('losses').textContent = status.losses || 0;
     document.getElementById('pnl').textContent = (status.pnl || 0).toFixed(2);
     document.getElementById('winRate').textContent = (status.winRate || 0).toFixed(1);
-    
     const trades = await fetchAPI('/api/trades?limit=20');
     const tbody = document.getElementById('tradesBody');
     if (!trades.length) {
@@ -1072,22 +952,16 @@ async function refreshData() {
         <td>${new Date(t.createdAt).toLocaleTimeString('fa-IR')}</td>
       </tr>`;
     }).join('');
-  } catch (e) {
-    console.error('Refresh error:', e);
-  }
+  } catch (e) { console.error('Refresh error:', e); }
 }
-
 async function killSwitch() {
   if (!confirm('⚠️ آیا مطمئنی؟ همه معاملات باز بسته می‌شوند!')) return;
   try {
     const res = await fetchAPI('/api/kill', { method: 'POST' });
     alert('✅ ' + (res.message || 'KILL SWITCH فعال شد.'));
     refreshData();
-  } catch (e) {
-    alert('❌ خطا: ' + e.message);
-  }
+  } catch (e) { alert('❌ خطا: ' + e.message); }
 }
-
 async function saveSetting(key) {
   const value = document.getElementById(key === 'maxConcurrent' ? 'maxConcurrent' : 'minScore').value;
   try {
@@ -1097,17 +971,98 @@ async function saveSetting(key) {
       body: JSON.stringify({ [key]: parseInt(value) })
     });
     alert('✅ تنظیمات ذخیره شد.');
-  } catch (e) {
-    alert('❌ خطا: ' + e.message);
-  }
+  } catch (e) { alert('❌ خطا: ' + e.message); }
 }
-
-// Auto refresh every 30 seconds
 setInterval(refreshData, 30000);
 refreshData();
 </script>
 </body>
 </html>`;
+}
+
+// ============================================================
+// PROCESS TELEGRAM UPDATE
+// ============================================================
+async function processUpdate(update, env, ctx) {
+  try {
+    if (!update?.message) return;
+    const message = update.message;
+    const chatId = message.chat?.id;
+    if (!chatId) return;
+    const text = String(message.text || "").trim();
+    if (!text) return;
+    const command = text.split(/\s+/)[0].toLowerCase();
+    
+    if (command === "/start" || command === "/help") {
+      await sendMessage(chatId, helpText(), env, { parse_mode:"Markdown" });
+    }
+    else if (command === "/health") {
+      await sendMessage(chatId, await healthText(env), env, { parse_mode:"Markdown" });
+    }
+    else if (command === "/subscribe") {
+      await subscribe(chatId, env);
+      await sendMessage(chatId, "🔔 اشتراک فعال شد.", env);
+    }
+    else if (command === "/unsubscribe") {
+      await unsubscribe(chatId, env);
+      await sendMessage(chatId, "🔕 اشتراک لغو شد.", env);
+    }
+    else if (command === "/resetstats") {
+      await sendMessage(chatId, "🧹 در حال پاک کردن آمار...", env);
+      const result = await resetStats(env);
+      await sendMessage(chatId, `✅ ${result.deleted} معامله حذف شد.`, env);
+    }
+    else if (command === "/stats") {
+      const result = await getStats(env);
+      await sendMessage(chatId, result, env, { parse_mode:"Markdown" });
+    }
+    else if (command === "/paper") {
+      const openCount = await getOpenTradesCount(env);
+      await sendMessage(chatId, `📝 معاملات باز: ${openCount}`, env);
+    }
+    else if (command === "/history") {
+      await sendMessage(chatId, "📚 برای تاریخچه دقیق، لطفاً از داشبورد استفاده کنید.", env);
+    }
+    else if (command === "/diagnostics") {
+      await sendMessage(chatId, "🔬 تحلیل تشخیصی: لطفاً از داشبورد استفاده کنید.", env);
+    }
+    else if (command === "/scan") {
+      await sendMessage(chatId, "🔎 در حال اسکن بازار...", env);
+      ctx.waitUntil((async () => {
+        try {
+          const tradeUpdate = await updateOpenPaperTrades(env);
+          if (tradeUpdate.closedTrades?.length) await notifyClosedTrades(tradeUpdate.closedTrades, env);
+          const scan = await performScan(env);
+          const paperInfo = await recordPaperTrades(scan.results, scan.btcContext, env);
+          const report = buildScanReport(scan.results, scan.btcContext, scan.elapsed, paperInfo, tradeUpdate);
+          await sendMessage(chatId, report, env, { parse_mode:"Markdown" });
+        } catch (error) {
+          await sendMessage(chatId, `❌ اسکن ناموفق: ${error.message}`, env);
+        }
+      })());
+    }
+  } catch (error) {
+    console.error("Process error:", error);
+  }
+}
+
+// ============================================================
+// SCHEDULED
+// ============================================================
+async function scheduledHandler(env) {
+  try {
+    const tradeUpdate = await updateOpenPaperTrades(env);
+    if (tradeUpdate.closedTrades?.length) await notifyClosedTrades(tradeUpdate.closedTrades, env);
+    const chats = await getSubscribedChats(env);
+    if (!chats.length) return;
+    const scan = await performScan(env);
+    const paperInfo = await recordPaperTrades(scan.results, scan.btcContext, env);
+    const report = buildScanReport(scan.results, scan.btcContext, scan.elapsed, paperInfo, tradeUpdate);
+    for (const chatId of chats) {
+      try { await sendMessage(chatId, report, env, { parse_mode:"Markdown" }); } catch {}
+      await sleep(100);
+    }
+  } catch (error) { console.error("Scheduled error:", error); }
 }
 
 // ============================================================
@@ -1118,7 +1073,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    // Serve dashboard HTML
     if (path === "/" || path === "/dashboard") {
       return new Response(getDashboardHTML(), {
         status: 200,
@@ -1126,12 +1080,10 @@ export default {
       });
     }
     
-    // API endpoints
     if (path.startsWith("/api/")) {
       return handleDashboardAPI(request, env);
     }
     
-    // Telegram webhook
     if (request.method === "POST") {
       try {
         const update = await request.json();
