@@ -1498,13 +1498,13 @@ async function analyzeSymbol(item) {
         getKlines(
           symbol,
           "5m",
-          160
+          260
         ),
 
         getKlines(
           symbol,
           "15m",
-          160
+          260
         ),
 
         getKlines(
@@ -1520,13 +1520,25 @@ async function analyzeSymbol(item) {
         )
       ]);
 
-    if (
-      results.some(
-        x => x.status !== "fulfilled"
-      )
-    ) {
+    const timeframeNames = ["5m", "15m", "1h", "4h"];
+    const failedFrames = results
+      .map((result, index) => {
+        if (result.status === "fulfilled") {
+          return null;
+        }
+
+        const reason = result.reason;
+        const message =
+          reason?.message ||
+          String(reason || "خطای نامشخص");
+
+        return `${timeframeNames[index]}: ${message}`;
+      })
+      .filter(Boolean);
+
+    if (failedFrames.length) {
       throw new Error(
-        "دریافت یکی از تایم‌فریم‌ها ناموفق بود."
+        failedFrames.join(" | ")
       );
     }
 
