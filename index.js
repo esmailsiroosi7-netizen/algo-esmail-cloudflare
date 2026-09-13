@@ -5020,107 +5020,100 @@ async function processUpdate(
         }
       );
 
-      ctx.waitUntil(
-        (async () => {
-          try {
-            console.log(
-              "BACKGROUND SCAN START",
-              chatId
-            );
+      // نکته مهم: خود processUpdate در سطح Worker با ctx.waitUntil اجرا می‌شود.
+      // بنابراین اینجا waitUntil دوم تو در تو استفاده نمی‌کنیم؛ در غیر این صورت
+      // زنجیره اسکن ممکن است بعد از ارسال پیام اولیه نیمه‌کاره رها شود.
+      try {
+        console.log(
+          "SCAN START",
+          chatId
+        );
 
-            // اول معاملات قبلی
-            const tradeUpdate =
-              await updateOpenPaperTrades(
-                env
-              );
+        // اول معاملات قبلی
+        const tradeUpdate =
+          await updateOpenPaperTrades(
+            env
+          );
 
-            console.log(
-              "PAPER UPDATE:",
-              tradeUpdate
-            );
+        console.log(
+          "PAPER UPDATE:",
+          tradeUpdate
+        );
 
-            // اعلان معاملات بسته‌شده
-            if (
-              tradeUpdate.closedTrades?.length
-            ) {
-              await notifyClosedTrades(
-                tradeUpdate.closedTrades,
-                env
-              );
-            }
+        // اعلان معاملات بسته‌شده
+        if (
+          tradeUpdate.closedTrades?.length
+        ) {
+          await notifyClosedTrades(
+            tradeUpdate.closedTrades,
+            env
+          );
+        }
 
-            // سپس بازار
-            const scan =
-              await performScan(
-                env
-              );
+        // سپس بازار
+        const scan =
+          await performScan(
+            env
+          );
 
-            // ثبت سیگنال‌های جدید
-            const paperInfo =
-              await recordPaperTrades(
-                scan.results,
-                scan.btcContext,
-                env
-              );
+        // ثبت سیگنال‌های جدید
+        const paperInfo =
+          await recordPaperTrades(
+            scan.results,
+            scan.btcContext,
+            env
+          );
 
-            const report =
-              buildScanReport(
-                scan.results,
-                scan.btcContext,
-                scan.elapsed,
-                paperInfo,
-                tradeUpdate
-              );
+        const report =
+          buildScanReport(
+            scan.results,
+            scan.btcContext,
+            scan.elapsed,
+            paperInfo,
+            tradeUpdate
+          );
 
-            await sendMessage(
-              chatId,
-              report,
-              env,
-              {
-                parse_mode: "Markdown"
-              }
-            );
-
-            console.log(
-              "BACKGROUND SCAN REPORT SENT",
-              chatId
-            );
-          } catch (error) {
-            console.error(
-              "BACKGROUND SCAN FAILED:",
-              error?.stack ||
-              error
-            );
-
-            try {
-              await sendMessage(
-                chatId,
-                `❌ *اسکن بازار متوقف شد.*
-
-دلیل:
-${String(
-                  error?.message ||
-                  error
-                ).slice(0, 700)}
-
-لطفاً /health را بررسی کن.`,
-                env,
-                {
-                  parse_mode: "Markdown"
-                }
-              );
-            } catch (
-              telegramError
-            ) {
-              console.error(
-                "ERROR MESSAGE SEND FAILED:",
-                telegramError?.stack ||
-                telegramError
-              );
-            }
+        await sendMessage(
+          chatId,
+          report,
+          env,
+          {
+            parse_mode: "Markdown"
           }
-        })()
-      );
+        );
+
+        console.log(
+          "SCAN REPORT SENT",
+          chatId
+        );
+      } catch (error) {
+        console.error(
+          "SCAN FAILED:",
+          error?.stack ||
+          error
+        );
+
+        // خطا باید حتماً به تلگرام برسد؛ حتی اگر بخشی از اسکن شکست بخورد.
+        try {
+          await sendMessage(
+            chatId,
+            `❌ *اسکن بازار متوقف شد.*\n\nدلیل:\n${String(
+              error?.message ||
+              error
+            ).slice(0, 700)}\n\nلطفاً /health را بررسی کن.`,
+            env,
+            {
+              parse_mode: "Markdown"
+            }
+          );
+        } catch (telegramError) {
+          console.error(
+            "ERROR MESSAGE SEND FAILED:",
+            telegramError?.stack ||
+            telegramError
+          );
+        }
+      }
 
       return;
     }
