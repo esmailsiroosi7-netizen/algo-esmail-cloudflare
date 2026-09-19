@@ -4,13 +4,6 @@
 // ============================================================
 
 const BASE_URL = "https://api.toobit.com";
-
-const TIMEOUT_MS = 6000;
-
-// ============================================================
-// تنظیمات اسکن
-// ============================================================
-
 const MAX_ANALYSIS_SYMBOLS = 15;
 const FAST_CANDIDATE_LIMIT = 45;
 const DEEP_ANALYSIS_LIMIT = 15;
