@@ -1,5 +1,5 @@
 // ============================================================
-// ALGO FJM V6.2 SCAN ENGINE SCANFIX - Toobit Futures Analyzer
+// ALGO FJM V6.2 SCANFIX V3 - Toobit Futures Analyzer
 // Cloudflare Workers + Telegram
 // ============================================================
 
@@ -35,7 +35,7 @@ const SCAN_STATUS_KEY = "system:scan_status";
 const SCAN_LOCK_TTL_MS = 8 * 60 * 1000;
 const PROCESSED_UPDATE_TTL_SECONDS = 24 * 60 * 60;
 
-// ALGO FJM V6.2 SCAN ENGINE - Futures-first configuration
+// ALGO FJM V6.2 SCANFIX V3 - Futures-first configuration
 // Entry logic uses 5m + 15m for execution and 1h + 4h for context.
 const FUTURES_TAKER_FEE = 0.0006;
 const FUTURES_MAKER_FEE = 0.0002;
@@ -482,6 +482,7 @@ async function getBestSymbols() {
     if (allowed.size && !allowed.has(x.symbol)) return false;
     return x.symbol.endsWith("-SWAP-USDT");
   });
+  const marketSymbolCount = candidates.length;
   const maxVol = Math.max(1, ...candidates.map(x => safeNumber(x.volume)));
   candidates = candidates.map(x => {
     const volScore = Math.log10(1 + safeNumber(x.volume)) / Math.log10(1 + maxVol);
@@ -496,7 +497,7 @@ async function getBestSymbols() {
     selected.push(item);
     if (selected.length >= DEEP_ANALYSIS_LIMIT) break;
   }
-  return selected;
+  return { selected, marketSymbolCount, fastCandidateCount: candidates.length };
 }
 
 // ============================================================
@@ -1591,7 +1592,10 @@ async function analyzeSymbol(item) {
         a4h
       );
 
-    const setup = combined.direction !== "خنثی"
+    const preFilterDirection = combined.direction;
+    const regime = combined.marketRegime;
+
+    const setup = preFilterDirection !== "خنثی"
       ? precisionSetup(
           candles5m,
           {
@@ -1599,7 +1603,7 @@ async function analyzeSymbol(item) {
             sweepHigh: a5m.sweepHigh || a15.sweepHigh,
             bos: a5m.bos !== "ندارد" ? a5m.bos : a15.bos
           },
-          combined.direction,
+          preFilterDirection,
           a5m.volumeRatio,
           a5m.atr,
           a5m.rsi
@@ -1614,17 +1618,64 @@ async function analyzeSymbol(item) {
       (a5m.bear > a5m.bull ? 1 : 0) +
       (a15.bear > a15.bull ? 1 : 0);
 
-    if (combined.direction === "خرید" && lowerBull < MIN_LOWER_TF_ALIGNMENT) {
+    const lowerAlignedForDirection =
+      preFilterDirection === "خرید" ? lowerBull :
+      preFilterDirection === "فروش" ? lowerBear : 0;
+
+    const rejectionReasons = [];
+
+    if (preFilterDirection === "خنثی") {
+      rejectionReasons.push("EDGE_LOW_OR_TF_CONFLICT");
+    }
+    if (preFilterDirection !== "خنثی" && lowerAlignedForDirection < MIN_LOWER_TF_ALIGNMENT) {
+      rejectionReasons.push("LOWER_TF_CONFLICT");
       combined.direction = "خنثی";
     }
-    if (combined.direction === "فروش" && lowerBear < MIN_LOWER_TF_ALIGNMENT) {
+    if (preFilterDirection !== "خنثی" && regime.direction === "خنثی") {
+      rejectionReasons.push(`REGIME_${regime.name}`);
       combined.direction = "خنثی";
     }
+    if (preFilterDirection !== "خنثی" && regime.direction !== "خنثی" && regime.direction !== preFilterDirection && regime.quality >= 70) {
+      rejectionReasons.push("REGIME_CONFLICT");
+      combined.direction = "خنثی";
+    }
+    if (preFilterDirection !== "خنثی" && ["گذار / تغییر رژیم", "نوسان بی‌کیفیت"].includes(regime.name)) {
+      rejectionReasons.push(`REGIME_${regime.name}`);
+      combined.direction = "خنثی";
+    }
+    if (preFilterDirection !== "خنثی" && !setup.ready) rejectionReasons.push("SETUP_NOT_READY");
+    if (preFilterDirection !== "خنثی" && setup.ready && combined.setupQuality < MIN_PRECISION_SCORE) rejectionReasons.push("PRECISION_SCORE_LOW");
+
+    const entryReady = Boolean(
+      combined.direction !== "خنثی" &&
+      setup.ready &&
+      combined.setupQuality >= MIN_PRECISION_SCORE &&
+      (combined.direction !== "فروش" || setup.quality >= 80)
+    );
+    if (preFilterDirection !== "خنثی" && !entryReady && !rejectionReasons.includes("SETUP_NOT_READY") && !rejectionReasons.includes("PRECISION_SCORE_LOW")) {
+      rejectionReasons.push("ENTRY_FILTER");
+    }
+
+    const diagnostic = {
+      rawDirection: preFilterDirection,
+      finalDirection: combined.direction,
+      score: combined.score,
+      setupQuality: combined.setupQuality,
+      setupReady: Boolean(setup.ready),
+      setupTrigger: setup.triggerType || "هیچ‌کدام",
+      setupQualityRaw: safeNumber(setup.quality),
+      lowerAlignment: lowerAlignedForDirection,
+      lowerBull,
+      lowerBear,
+      regime: regime.name,
+      regimeDirection: regime.direction,
+      regimeQuality: regime.quality,
+      rejectionReasons
+    };
 
     return {
       ...item,
       symbol,
-      // Use the latest ticker-derived price when available, not an older candle close.
       price: safeNumber(item.price) || a5m.price,
       analysis5m: a5m,
       analysis15: a15,
@@ -1632,7 +1683,8 @@ async function analyzeSymbol(item) {
       analysis4h: a4h,
       ...combined,
       precisionSetup: setup,
-      entryReady: Boolean(setup.ready && combined.setupQuality >= MIN_PRECISION_SCORE && (combined.direction !== "فروش" || setup.quality >= 80))
+      entryReady,
+      scanDiagnostic: diagnostic
     };
   } catch (error) {
     console.error(
@@ -2944,7 +2996,7 @@ function buildScanReport(
     .join("\n");
 
   let text = `
-🤖 *ALGO FJM V6.2 SCAN ENGINE*
+🤖 *ALGO FJM V6.2 SCANFIX V3*
 
 ✅ اسکن بازار توبیت تمام شد.
 
@@ -3018,28 +3070,106 @@ function buildScanReport(
 
 async function performScan(env) {
   const started = Date.now();
-  const diagnostics = { marketSymbols: 0, fastCandidates: FAST_CANDIDATE_LIMIT, deepAnalyzed: 0, deepFailed: 0, directional: 0, regimeRejected: 0, setupRejected: 0, riskRejected: 0, derivativeEnriched: 0, finalOpportunities: 0 };
+  const diagnostics = {
+    marketSymbols: 0,
+    fastCandidates: 0,
+    deepAnalyzed: 0,
+    deepFailed: 0,
+    directional: 0,
+    regimeRejected: 0,
+    setupRejected: 0,
+    riskRejected: 0,
+    derivativeEnriched: 0,
+    finalOpportunities: 0,
+    symbols: []
+  };
+
   try {
-    const symbols = await getBestSymbols();
+    const selection = await getBestSymbols();
+    const symbols = selection.selected || [];
+    diagnostics.marketSymbols = safeNumber(selection.marketSymbolCount);
+    diagnostics.fastCandidates = safeNumber(selection.fastCandidateCount);
     diagnostics.deepAnalyzed = symbols.length;
+
     if (!symbols.length) throw new Error("هیچ ارز مناسبی از Toobit دریافت نشد.");
+
     const btcPromise = getBTCContext();
     const results = await runInBatches(symbols, ANALYSIS_BATCH, analyzeSymbol);
     diagnostics.deepFailed = results.filter(x => x.failed).length;
-    diagnostics.directional = results.filter(x => !x.failed && x.direction !== "خنثی").length;
+
     const btcContext = await btcPromise;
-    const pool = results.filter(x => !x.failed && x.direction !== "خنثی").sort((a,b) => safeNumber(b.score)-safeNumber(a.score)).slice(0, DERIVATIVE_SHORTLIST_LIMIT);
+
+    const directionalBeforeDerivatives = results.filter(
+      x => !x.failed && x.scanDiagnostic?.rawDirection !== "خنثی"
+    );
+    diagnostics.directional = directionalBeforeDerivatives.length;
+
+    const pool = results
+      .filter(x => !x.failed && x.direction !== "خنثی")
+      .sort((a,b) => safeNumber(b.score) - safeNumber(a.score))
+      .slice(0, DERIVATIVE_SHORTLIST_LIMIT);
+
     diagnostics.derivativeEnriched = pool.length;
     const enrichedPool = await enrichDerivatives(pool);
     const bySymbol = new Map(enrichedPool.map(x => [x.symbol, x]));
     const enriched = results.map(x => bySymbol.get(x.symbol) || x);
-    const ready = enriched.filter(x => !x.failed && x.entryReady).length;
-    diagnostics.setupRejected = Math.max(0, diagnostics.directional - ready);
-    diagnostics.riskRejected = enriched.filter(x => x.entryReady && x.score < MIN_SIGNAL_SCORE).length;
-    diagnostics.regimeRejected = enriched.filter(x => !x.failed && x.direction !== "خنثی" && x.marketRegime && (x.marketRegime.direction === "خنثی" || ["گذار / تغییر رژیم","نوسان بی‌کیفیت","رنج کم‌نوسان"].includes(x.marketRegime.name))).length;
-    diagnostics.finalOpportunities = enriched.filter(x => !x.failed && x.direction !== "خنثی" && x.entryReady && x.score >= MIN_SIGNAL_SCORE && x.marketRegime && x.marketRegime.direction !== "خنثی" && !["گذار / تغییر رژیم","نوسان بی‌کیفیت","رنج کم‌نوسان"].includes(x.marketRegime.name)).length;
-    return { results: enriched, btcContext, elapsed: Date.now()-started, diagnostics };
-  } catch (error) { console.error("SCAN ERROR:", error?.stack || error); throw error; }
+
+    for (const item of enriched) {
+      const d = item.scanDiagnostic || {};
+      const reasons = Array.isArray(d.rejectionReasons) ? [...d.rejectionReasons] : [];
+
+      if (!item.failed && d.rawDirection !== "خنثی") {
+        if (d.lowerAlignment < MIN_LOWER_TF_ALIGNMENT && !reasons.includes("LOWER_TF_CONFLICT")) reasons.push("LOWER_TF_CONFLICT");
+        if (d.regimeDirection === "خنثی" && !reasons.some(x => x.startsWith("REGIME_"))) reasons.push(`REGIME_${d.regime || "UNKNOWN"}`);
+        if (d.regimeDirection !== "خنثی" && d.regimeDirection !== d.rawDirection && safeNumber(d.regimeQuality) >= 70 && !reasons.includes("REGIME_CONFLICT")) reasons.push("REGIME_CONFLICT");
+        if (!d.setupReady && !reasons.includes("SETUP_NOT_READY")) reasons.push("SETUP_NOT_READY");
+        if (d.setupReady && safeNumber(d.setupQuality) < MIN_PRECISION_SCORE && !reasons.includes("PRECISION_SCORE_LOW")) reasons.push("PRECISION_SCORE_LOW");
+        if (safeNumber(item.score) < MIN_SIGNAL_SCORE && !reasons.includes("SCORE_LOW")) reasons.push("SCORE_LOW");
+      }
+
+      if (item.failed) reasons.push("ANALYSIS_FAILED");
+
+      item.scanDiagnostic = { ...d, score: safeNumber(item.score), rejectionReasons: reasons };
+    }
+
+    diagnostics.setupRejected = enriched.filter(x => !x.failed && x.scanDiagnostic?.rawDirection !== "خنثی" && (!x.entryReady || x.scanDiagnostic?.rejectionReasons?.includes("SETUP_NOT_READY") || x.scanDiagnostic?.rejectionReasons?.includes("PRECISION_SCORE_LOW"))).length;
+    diagnostics.regimeRejected = enriched.filter(x => !x.failed && x.scanDiagnostic?.rejectionReasons?.some(r => r.startsWith("REGIME_"))).length;
+    diagnostics.riskRejected = enriched.filter(x => !x.failed && x.scanDiagnostic?.rawDirection !== "خنثی" && x.entryReady && safeNumber(x.score) < MIN_SIGNAL_SCORE).length;
+
+    const finalCandidates = enriched
+      .filter(x => !x.failed && x.direction !== "خنثی" && x.entryReady && x.score >= MIN_SIGNAL_SCORE && x.marketRegime && x.marketRegime.direction !== "خنثی" && !["گذار / تغییر رژیم", "نوسان بی‌کیفیت", "رنج کم‌نوسان"].includes(x.marketRegime.name))
+      .filter(x => calculateTrade(x) !== null);
+
+    diagnostics.finalOpportunities = finalCandidates.length;
+
+    const finalSymbols = new Set(finalCandidates.map(x => x.symbol));
+    for (const item of enriched) {
+      if (!item.failed && item.scanDiagnostic?.rawDirection !== "خنثی" && !finalSymbols.has(item.symbol)) {
+        if (safeNumber(item.score) >= MIN_SIGNAL_SCORE && item.entryReady && !item.scanDiagnostic.rejectionReasons.some(r => r.startsWith("RISK_"))) {
+          const trade = calculateTrade(item);
+          if (!trade && !item.scanDiagnostic.rejectionReasons.includes("RISK_REJECTED")) item.scanDiagnostic.rejectionReasons.push("RISK_REJECTED");
+        }
+      }
+    }
+
+    diagnostics.symbols = enriched.map(item => ({
+      symbol: item.symbol,
+      failed: Boolean(item.failed),
+      rawDirection: item.scanDiagnostic?.rawDirection || (item.failed ? "ERROR" : "خنثی"),
+      finalDirection: item.direction || "خنثی",
+      score: safeNumber(item.score),
+      setupQuality: safeNumber(item.scanDiagnostic?.setupQuality),
+      setupReady: Boolean(item.scanDiagnostic?.setupReady),
+      lowerAlignment: safeNumber(item.scanDiagnostic?.lowerAlignment),
+      regime: item.scanDiagnostic?.regime || item.marketRegime?.name || "نامشخص",
+      reasons: item.scanDiagnostic?.rejectionReasons || []
+    }));
+
+    return { results: enriched, btcContext, elapsed: Date.now() - started, diagnostics };
+  } catch (error) {
+    console.error("SCAN ERROR:", error?.stack || error);
+    throw error;
+  }
 }
 
 // ============================================================
@@ -3321,7 +3451,7 @@ async function getStats(
       : 0;
 
   return `
-📊 *آمار معاملات آزمایشی ALGO FJM V6.2 SCAN ENGINE*
+📊 *آمار معاملات آزمایشی ALGO FJM V6.2 SCANFIX V3*
 
 کل معاملات: *${total}*
 
@@ -3475,7 +3605,7 @@ async function getTradeHistory(
   }
 
   let text = `
-📚 *تاریخچه معاملات ALGO FJM V6.2 SCAN ENGINE*
+📚 *تاریخچه معاملات ALGO FJM V6.2 SCANFIX V3*
 
 تعداد نمایش: *${selected.length}*
 
@@ -4006,7 +4136,7 @@ async function getDashboard(env) {
     : 0;
 
   return `
-📊 *داشبورد ALGO FJM V6.2 SCAN ENGINE*
+📊 *داشبورد ALGO FJM V6.2 SCANFIX V3*
 
 📚 معاملات بسته: ${closed.length}
 🟢 برد: ${wins.length}
@@ -4040,8 +4170,8 @@ function mainMenuKeyboard() {
       [{ text: "🔎 اسکن بازار" }, { text: "📊 آمار" }],
       [{ text: "📝 معاملات باز" }, { text: "📚 تاریخچه" }],
       [{ text: "📈 داشبورد" }, { text: "🔬 تشخیص" }],
-      [{ text: "🩺 وضعیت ربات" }, { text: "🔔 گزارش خودکار" }],
-      [{ text: "ℹ️ راهنما" }]
+      [{ text: "🩺 وضعیت ربات" }, { text: "🩺 وضعیت اسکن" }],
+      [{ text: "🔔 گزارش خودکار" }, { text: "ℹ️ راهنما" }]
     ],
     resize_keyboard: true,
     is_persistent: true,
@@ -4055,7 +4185,7 @@ function backKeyboard() {
   };
 }
 
-async function sendMenu(chatId, env, text = "🤖 *ALGO FJM V6.2 SCAN ENGINE*\n\nیک گزینه را انتخاب کن:") {
+async function sendMenu(chatId, env, text = "🤖 *ALGO FJM V6.2 SCANFIX V3*\n\nیک گزینه را انتخاب کن:") {
   return sendMessage(chatId, text, env, { parse_mode: "Markdown", reply_markup: mainMenuKeyboard() });
 }
 
@@ -4065,7 +4195,7 @@ async function sendMenu(chatId, env, text = "🤖 *ALGO FJM V6.2 SCAN ENGINE*\n\
 
 function helpText() {
   return `
-🤖 *ALGO FJM V6.2 SCAN ENGINE*
+🤖 *ALGO FJM V6.2 SCANFIX V3*
 
 منوی اصلی را از دکمه‌های پایین انتخاب کن.
 
@@ -4094,6 +4224,8 @@ function helpText() {
 /resetstats 🧹 پاک کردن کامل آمار قبلی
 
 /health 🩺 بررسی وضعیت ربات
+
+/scanstatus 🩺 وضعیت و علت رد شدن نمادهای آخرین اسکن
 
 /help 📚 راهنما
 
@@ -4205,7 +4337,7 @@ async function healthText(
 
 📡 Toobit API: ${toobitStatus}
 
-⚙️ نسخه: V6.2 SCAN ENGINE
+⚙️ نسخه: V6.2 SCANFIX V3
 
 🔎 تعداد اسکن: ${MAX_ANALYSIS_SYMBOLS} ارز
 
@@ -4479,7 +4611,14 @@ async function processUpdate(
       const elapsed = status.elapsed != null ? `${safeNumber(status.elapsed) / 1000} ثانیه` : "نامشخص";
       const d = status.diagnostics || {};
 
-      const text = `🩺 *وضعیت آخرین اسکن*\n\n📌 وضعیت: *${state}*\n🕐 زمان شروع: ${status.startedAt ? new Date(status.startedAt).toISOString() : "نامشخص"}\n⏱ مدت: ${elapsed}\n\n📦 بازار: ${d.marketSymbols ?? "نامشخص"}\n⚡ کاندید سریع: ${d.fastCandidates ?? "نامشخص"}\n🔬 تحلیل عمیق: ${d.deepAnalyzed ?? "نامشخص"}\n❌ تحلیل ناموفق: ${d.deepFailed ?? "نامشخص"}\n🧭 جهت‌دار: ${d.directional ?? "نامشخص"}\n🧪 مشتقات: ${d.derivativeEnriched ?? "نامشخص"}\n🎯 فرصت نهایی: ${d.finalOpportunities ?? "نامشخص"}\n\n${status.error ? `⚠️ خطا: \`${String(status.error).slice(0, 700)}\`` : ""}`;
+      const symbolLines = Array.isArray(d.symbols) && d.symbols.length
+        ? d.symbols.map(x => {
+            const reasons = Array.isArray(x.reasons) && x.reasons.length ? x.reasons.join(", ") : "—";
+            return `• ${x.symbol}: ${x.rawDirection} → ${x.finalDirection} | S:${x.score} | Setup:${x.setupQuality} | Align:${x.lowerAlignment}/2 | ${x.regime} | ${reasons}`;
+          }).join("\n")
+        : "اطلاعات نمادها در این اسکن ثبت نشده است.";
+
+      const text = `🩺 *وضعیت آخرین اسکن*\n\n📌 وضعیت: *${state}*\n🕐 زمان شروع: ${status.startedAt ? new Date(status.startedAt).toISOString() : "نامشخص"}\n⏱ مدت: ${elapsed}\n\n📦 بازار: ${d.marketSymbols ?? "نامشخص"}\n⚡ کاندید سریع: ${d.fastCandidates ?? "نامشخص"}\n🔬 تحلیل عمیق: ${d.deepAnalyzed ?? "نامشخص"}\n❌ تحلیل ناموفق: ${d.deepFailed ?? "نامشخص"}\n🧭 جهت‌دار: ${d.directional ?? "نامشخص"}\n🧪 مشتقات: ${d.derivativeEnriched ?? "نامشخص"}\n🛠 رد رژیم: ${d.regimeRejected ?? "نامشخص"}\n🛠 رد Setup: ${d.setupRejected ?? "نامشخص"}\n🛡 رد ریسک/امتیاز: ${d.riskRejected ?? "نامشخص"}\n🎯 فرصت نهایی: ${d.finalOpportunities ?? "نامشخص"}\n\n🔬 *جزئیات ۸ تحلیل:*\n${symbolLines}\n\n${status.error ? `⚠️ خطا: \`${String(status.error).slice(0, 700)}\`` : ""}`;
       await sendMessage(chatId, text, env, { parse_mode: "Markdown" });
       return;
     }
@@ -4553,7 +4692,7 @@ async function processUpdate(
 
 📊 سیستم Paper Trade از صفر شروع شد.
 
-🤖 ALGO FJM V6.2 SCAN ENGINE
+🤖 ALGO FJM V6.2 SCANFIX V3
 
 ⚠️ از این لحظه اطلاعات جدید ثبت می‌شود.
 `,
@@ -4941,7 +5080,7 @@ export default {
       request.method === "GET"
     ) {
       return new Response(
-        "ALGO FJM V6.2 SCAN ENGINE is LIVE 🤖",
+        "ALGO FJM V6.2 SCANFIX V3 is LIVE 🤖",
         {
           status: 200,
 
