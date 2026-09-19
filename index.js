@@ -4,12 +4,19 @@
 // ============================================================
 
 const BASE_URL = "https://api.toobit.com";
-const MAX_ANALYSIS_SYMBOLS = 15;
+
+const TIMEOUT_MS = 6000;
+
+// ============================================================
+// تنظیمات اسکن
+// ============================================================
+
+const MAX_ANALYSIS_SYMBOLS = 8;
 const FAST_CANDIDATE_LIMIT = 45;
-const DEEP_ANALYSIS_LIMIT = 15;
-const DERIVATIVE_SHORTLIST_LIMIT = 6;
+const DEEP_ANALYSIS_LIMIT = 8;
+const DERIVATIVE_SHORTLIST_LIMIT = 2;
 const ANALYSIS_BATCH = 4;
-const SHORTLIST_FOR_DERIVATIVES = 4;
+const SHORTLIST_FOR_DERIVATIVES = 2;
 const TP1_CLOSE_FRACTION = 0.30;
 const TP2_CLOSE_FRACTION = 0.30;
 const TP3_CLOSE_FRACTION = 0.40;
@@ -4297,6 +4304,19 @@ async function markUpdateProcessed(env, updateId) {
   try { await env.ALGO_ESMAIL_KV.put(`update:${updateId}`, "1", { expirationTtl: PROCESSED_UPDATE_TTL_SECONDS }); } catch (error) { console.error("UPDATE DEDUPE ERROR:", error?.stack || error); }
 }
 
+async function getScanStatus(env) {
+  if (!env.ALGO_ESMAIL_KV) {
+    return null;
+  }
+  try {
+    const raw = await env.ALGO_ESMAIL_KV.get(SCAN_STATUS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (error) {
+    console.error("SCAN STATUS READ ERROR:", error?.stack || error);
+    return null;
+  }
+}
+
 async function runManualScan(chatId, env) {
   const lock = await acquireScanLock(env, "manual", chatId);
   if (!lock.acquired) {
@@ -4307,6 +4327,7 @@ async function runManualScan(chatId, env) {
   const startedAt = Date.now();
   await setScanStatus(env, { state: "RUNNING", source: "manual", chatId, startedAt, finishedAt: null, error: null });
   try {
+    await sendMessage(chatId, "🔎 *اسکن بازار شروع شد.*\n\n⏳ نتیجه بعد از پایان اسکن ارسال می‌شود.", env, { parse_mode: "Markdown" });
     console.log("SCAN START", chatId, lockId);
     const scan = await performScan(env);
     await refreshScanLock(env, lockId);
@@ -4388,6 +4409,7 @@ async function processUpdate(
       "📈 داشبورد": "/dashboard",
       "🔬 تشخیص": "/diagnostics",
       "🩺 وضعیت ربات": "/health",
+      "🩺 وضعیت اسکن": "/scanstatus",
       "🔔 گزارش خودکار": "/subscribe",
       "ℹ️ راهنما": "/help"
     };
@@ -4433,6 +4455,32 @@ async function processUpdate(
         }
       );
 
+      return;
+    }
+
+    // ========================================================
+    // SCAN STATUS
+    // ========================================================
+
+    if (mappedCommand === "/scanstatus") {
+      const status = await getScanStatus(env);
+      if (!status) {
+        await sendMessage(chatId, "🩺 هنوز هیچ وضعیت اسکن ثبت نشده است.", env);
+        return;
+      }
+
+      const stateMap = {
+        RECEIVED: "📥 دریافت شد",
+        RUNNING: "🔄 در حال اجرا",
+        COMPLETED: "✅ تکمیل شد",
+        FAILED: "❌ ناموفق"
+      };
+      const state = stateMap[status.state] || status.state || "نامشخص";
+      const elapsed = status.elapsed != null ? `${safeNumber(status.elapsed) / 1000} ثانیه` : "نامشخص";
+      const d = status.diagnostics || {};
+
+      const text = `🩺 *وضعیت آخرین اسکن*\n\n📌 وضعیت: *${state}*\n🕐 زمان شروع: ${status.startedAt ? new Date(status.startedAt).toISOString() : "نامشخص"}\n⏱ مدت: ${elapsed}\n\n📦 بازار: ${d.marketSymbols ?? "نامشخص"}\n⚡ کاندید سریع: ${d.fastCandidates ?? "نامشخص"}\n🔬 تحلیل عمیق: ${d.deepAnalyzed ?? "نامشخص"}\n❌ تحلیل ناموفق: ${d.deepFailed ?? "نامشخص"}\n🧭 جهت‌دار: ${d.directional ?? "نامشخص"}\n🧪 مشتقات: ${d.derivativeEnriched ?? "نامشخص"}\n🎯 فرصت نهایی: ${d.finalOpportunities ?? "نامشخص"}\n\n${status.error ? `⚠️ خطا: \`${String(status.error).slice(0, 700)}\`` : ""}`;
+      await sendMessage(chatId, text, env, { parse_mode: "Markdown" });
       return;
     }
 
@@ -4917,19 +4965,26 @@ export default {
           await request.json();
 
         const updateId = update?.update_id;
-        if (await isUpdateProcessed(env, updateId)) {
-          return new Response("OK", { status: 200 });
-        }
-        await markUpdateProcessed(env, updateId);
-
         const text = String(update?.message?.text || "").trim();
         const command = text.split(/\s+/)[0].toLowerCase();
 
         if (command === "/scan" && update?.message?.chat?.id) {
           const chatId = update.message.chat.id;
-          await sendMessage(chatId, "🔎 *اسکن بازار شروع شد.*\n\n⏳ نتیجه بعد از پایان اسکن ارسال می‌شود.", env, { parse_mode: "Markdown" });
-          ctx.waitUntil(runManualScan(chatId, env));
+          const task = (async () => {
+            try {
+              if (await isUpdateProcessed(env, updateId)) return;
+              await setScanStatus(env, { state: "RECEIVED", source: "manual", chatId, receivedAt: Date.now(), startedAt: null, finishedAt: null, error: null });
+              await runManualScan(chatId, env);
+            } finally {
+              await markUpdateProcessed(env, updateId);
+            }
+          })();
+          ctx.waitUntil(task);
         } else {
+          if (await isUpdateProcessed(env, updateId)) {
+            return new Response("OK", { status: 200 });
+          }
+          await markUpdateProcessed(env, updateId);
           ctx.waitUntil(processUpdate(update, env, ctx));
         }
 
